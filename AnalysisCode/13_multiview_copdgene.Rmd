@@ -1,0 +1,603 @@
+---
+title: "Multi-Omic Risk Score Associations"
+author: "Iain R. Konigsberg"
+date: '`r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: true
+---
+
+# Background
+
+This Rmd contains code to evaluate MultRS in COPDGene testset participants. 
+
+***
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = 'C:/Users/konigsbi/Desktop/ors_topmed/January/Results/multiview/')
+
+```
+
+```{r message=F}
+library(dplyr)
+library(ggpubr)
+library(stringr)
+library(tidyr)
+library(sjPlot)
+library(MASS)
+library(rsq)
+library(pROC)
+library(glmnetUtils)
+library(multiview)
+library(colorspace) #color darkening
+library(ggbeeswarm)
+
+start = Sys.time()
+
+theme_set(theme_bw())
+
+set.seed(11)
+
+setwd("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/multiview/")
+files = dir()
+
+#do i use the right pred approach?
+
+files = files[grep("predictions", files)]
+files = files[-grep("std", files)]
+
+```
+
+***
+
+# Prepare Data
+
+```{r}
+pd = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/pd_main_overlap.csv", row.names = 1)
+
+#removing prism since not defined in other studies
+pd[!is.na(pd$finalGold_P2) & pd$finalGold_P2 == -1, ]$finalGold_P2 = NA
+pd$GoldCategory_P2 = as.factor(pd$finalGold_P2)
+
+pd$copd_P2 = NA
+pd[!is.na(pd$FEV1_FVC_post_P2) & pd$FEV1_FVC_post_P2 < .7, ]$copd_P2 = 1
+pd[!is.na(pd$FEV1_FVC_post_P2) & pd$FEV1_FVC_post_P2 > .7, ]$copd_P2 = 0
+
+pd$Change_P2_P3_FRC_TLC_ratio_Thirona = pd$FRC_TLC_ratio_Thirona_P3 - pd$FRC_TLC_ratio_Thirona_P2 
+pd$Change_P2_P3_pctGasTrap_Thirona = pd$pctGasTrap_Thirona_P3 - pd$pctGasTrap_Thirona_P2 
+pd$Change_P2_P3_lung_density_vnb = pd$lung_density_vnb_P3 - pd$lung_density_vnb_P2
+pd$Change_P2_P3_Pi10_Thirona = pd$Pi10_Thirona_P3 - pd$Pi10_Thirona_P2
+pd$Change_P2_P3_AWT_seg_Thirona = pd$AWT_seg_Thirona_P3 - pd$AWT_seg_Thirona_P2
+pd$Change_P2_P3_WallAreaPct_seg_Thirona = pd$WallAreaPct_seg_Thirona_P3 - pd$WallAreaPct_seg_Thirona_P2
+
+num_vars = c("AWT_seg_Thirona_P2", "distwalked_P2",  
+             "FEV1_post_P2", "lung_density_vnb_P2")
+log_vars = c("pctEmph_Thirona_P2")
+covars = c("Age_P2", "gender", "race", "scanner_model_clean_P2", "BMI_P2", "smoking_status_P2", "ATS_PackYears_P2", "ccenter_P2", "Height_CM_P2")
+
+
+#NEED TO ADD IN ADDITIONAL
+#fix covar adjs. 
+adjust_null = c("distwalked_P2")
+adjust_spiro = c("FEV1_post_P2")
+adjust_ct = c("AWT_seg_Thirona_P2", "lung_density_vnb_P2", "pctEmph_Thirona_P2")
+
+
+pd = pd %>% dplyr::select(sid, all_of(num_vars), all_of(log_vars), all_of(covars))
+rownames(pd) = pd$sid
+
+
+```
+
+
+```{r}
+df = readRDS(files[1])
+namey = rownames(df)
+for (x in files[2:length(files)]){
+  file = readRDS(x)
+  df = cbind(df, file)
+}
+rownames(df) = namey
+
+#name odd cols
+preds = gsub(".rds", "", files)
+phenos = gsub("predictions", "pheno", preds)
+
+colnames(df) = c(rbind(preds, phenos))
+
+df = merge(df, pd, by = "row.names")
+rownames(df) = df$Row.names
+
+```
+
+# MultRS Associations
+
+```{r}
+#rho 0
+results = NULL
+for (x in adjust_null[adjust_null %in% c(num_vars, log_vars)]){
+  x = adjust_null[1]
+  pheno = paste0("rho_0_pheno_", x)
+  score = paste0("rho_0_predictions_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)]){
+  pheno = paste0("rho_0_pheno_", x)
+  score = paste0("rho_0_predictions_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% c(num_vars, log_vars)]){
+  pheno = paste0("rho_0_pheno_", x)
+  score = paste0("rho_0_predictions_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+colnames(results) = c("p", "beta", "beta.hi", "beta.lo", "rsq.partial", "rsq.full", "rsq.null")
+rownames(results) = c(adjust_null[adjust_null %in% c(num_vars, log_vars)], adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)], adjust_ct[adjust_ct %in% c(num_vars, log_vars)])
+rho0 = as.data.frame(results)
+
+#rho 0.5
+results = NULL
+for (x in adjust_null[adjust_null %in% c(num_vars, log_vars)]){
+  x = adjust_null[1]
+  pheno = paste0("rho_0.5_pheno_", x)
+  score = paste0("rho_0.5_predictions_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)]){
+  pheno = paste0("rho_0.5_pheno_", x)
+  score = paste0("rho_0.5_predictions_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% c(num_vars, log_vars)]){
+  pheno = paste0("rho_0.5_pheno_", x)
+  score = paste0("rho_0.5_predictions_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+colnames(results) = c("p", "beta", "beta.hi", "beta.lo", "rsq.partial", "rsq.full", "rsq.null")
+rownames(results) = c(adjust_null[adjust_null %in% c(num_vars, log_vars)], adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)], adjust_ct[adjust_ct %in% c(num_vars, log_vars)])
+rho.5 = as.data.frame(results)
+
+#rho 1
+results = NULL
+for (x in adjust_null[adjust_null %in% c(num_vars, log_vars)]){
+  x = adjust_null[1]
+  pheno = paste0("rho_1_pheno_", x)
+  score = paste0("rho_1_predictions_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)]){
+  pheno = paste0("rho_1_pheno_", x)
+  score = paste0("rho_1_predictions_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% c(num_vars, log_vars)]){
+  pheno = paste0("rho_1_pheno_", x)
+  score = paste0("rho_1_predictions_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+colnames(results) = c("p", "beta", "beta.hi", "beta.lo", "rsq.partial", "rsq.full", "rsq.null")
+rownames(results) = c(adjust_null[adjust_null %in% c(num_vars, log_vars)], adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)], adjust_ct[adjust_ct %in% c(num_vars, log_vars)])
+rho1 = as.data.frame(results)
+
+```
+
+```{r}
+rho0$type = "0"
+rho.5$type = "0.5"
+rho1$type = "1"
+
+rho0$pheno = rownames(rho0)
+rho.5$pheno = rownames(rho.5)
+rho1$pheno = rownames(rho1)
+
+full = rbind(rho0, rho.5, rho1)
+
+#full$bh = p.adjust(full$p, method = "bonferroni")
+full$bh = p.adjust(full$p, method = "BH")
+
+full$sig = F
+full[full$bh <= .05, ]$sig = T
+
+full$pheno = gsub("_P2", "", full$pheno)
+full$pheno = gsub("distwalked", "6MW Distance", full$pheno)
+full$pheno = gsub("FEV1_post", "FEV1", full$pheno)
+full$pheno = gsub("AWT_seg_Thirona", "Airway Wall Thickness", full$pheno)
+full$pheno = gsub("lung_density_vnb", "Lung Density", full$pheno)
+full$pheno = gsub("pctEmph_Thirona", "Emphysema", full$pheno)
+
+```
+
+```{r}
+a = ggplot(full, aes(beta, factor(pheno, levels = rev(levels(factor(pheno)))), alpha = sig, group = type, color = type)) + 
+  geom_point(position = position_dodge(width = .5)) + 
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") + 
+  geom_errorbar(aes(xmin = beta.lo, xmax = beta.hi), width = 0, position = position_dodge(width = .5)) + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+  labs(x = "\u03b2 Coefficient", y = "", color = "Rho") + 
+  scale_alpha_manual(values = c(1)) +
+  guides(alpha = "none")
+
+
+b = ggplot(full) + 
+  geom_bar(aes(rsq.full, pheno, fill = type, alpha = sig), stat = "identity", position = "dodge") + 
+  geom_bar(aes(rsq.null, pheno), stat = "identity", position = "dodge") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  labs(x = bquote("Adjusted R"^2), y = "", fill = "Rho") +
+  scale_y_discrete(limits = rev(levels(factor(full$pheno)))) + 
+  scale_alpha_manual(values = c(1)) +
+  guides(alpha = "none") +
+  xlim(0, 1)
+
+
+
+```
+
+
+```{r}
+#read in pd to merge
+full = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/COPDGene_testing_results.csv", row.names = 1)
+full = full[full$pheno %in% rho1$pheno, ]
+rho1$bh = NA
+rho1$sig = NA
+rho1$class = c("gaussian", "gaussian", "gaussian", "gaussian", "log")
+
+full = rbind(rho1, full)
+full$bh = p.adjust(full$p, method = "BH")
+full$sig = F
+full[full$bh <= .05, ]$sig = T
+#figure out sig. 
+full[full$type == "1", ]$type = "Combined"
+
+full$pheno = gsub("_P2", "", full$pheno)
+full$pheno = gsub("distwalked", "6MW Distance", full$pheno)
+full$pheno = gsub("FEV1_post", "FEV1", full$pheno)
+full$pheno = gsub("AWT_seg_Thirona", "Airway Wall Thickness", full$pheno)
+full$pheno = gsub("lung_density_vnb", "Lung Density", full$pheno)
+full$pheno = gsub("pctEmph_Thirona", "Emphysema", full$pheno)
+
+write.csv(full, "C:/Users/konigsbi/Desktop/ors_topmed/manuscript/Supplement/Full_multi_forSupp.csv")
+
+
+c = ggplot(full, aes(beta, factor(pheno, levels = rev(levels(factor(pheno)))), alpha = sig, group = type, color = type)) + 
+  geom_point(position = position_dodge(width = .5)) + 
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") + 
+  geom_errorbar(aes(xmin = beta.lo, xmax = beta.hi), width = 0, position = position_dodge(width = .5)) + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+  labs(x = "\u03b2 Coefficient", y = "", color = "") + 
+  scale_alpha_manual(values = c(1)) +
+  scale_color_manual(values = c("black", "#F8766D", "#00BA38", "#619CFF")) 
+
+
+d = ggplot(full) + 
+  geom_bar(aes(rsq.full, pheno, fill = type, alpha = sig), stat = "identity", position = "dodge") + 
+  geom_bar(aes(rsq.null, pheno), stat = "identity", position = "dodge") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  labs(x = bquote("Adjusted R"^2), y = "", fill = "") +
+  scale_y_discrete(limits = rev(levels(factor(full$pheno)))) + 
+  scale_alpha_manual(values = c(1)) +
+  guides(alpha = "none") +
+  xlim(0, 1) +
+  scale_fill_manual(values = c("black", "#F8766D", "#00BA38", "#619CFF")) 
+
+
+
+```
+
+```{r}
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic))
+}
+
+met = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/models_copdgene/model_metabolite_lung_density_vnb_P2.rds")
+prot = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/models_copdgene/model_protein_lung_density_vnb_P2.rds")
+rna = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/models_copdgene/model_transcript_lung_density_vnb_P2.rds")
+comb = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/multiview/rho_1_model_lung_density_vnb_P2.rds")
+
+metnames = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/Metabolome/COPDGene_MetaboliteInformation_202303.csv")
+protnames = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/Proteome/copdg_soma_5k_p2_metadata_Jun21.csv")
+ctnames = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/Transcriptome/ctnames.csv")
+
+#met
+test = model_select(met)
+coefs = as.data.frame(as.matrix(coef(met$modlist[[test[1]]], s = test[2])))
+coefs = coefs[coefs$s1 != 0, , drop = F]
+coefs = coefs[rownames(coefs) != "(Intercept)", , drop = F]
+nrow(coefs) #179
+coefs = coefs[order(abs(coefs$s1), decreasing = T), , drop = F]
+coefs = coefs[1:20, , drop = F]
+coefs$name = NA
+for (x in 1:nrow(coefs)){
+  coefs$name[x] = metnames[metnames$metabid == rownames(coefs)[x], ]$CHEMICAL_NAME
+}
+coefs$type = "Metabolite"
+coefs$dir = NA
+coefs[coefs$s1 > 0 , ]$dir = "Positive"
+coefs[coefs$s1 < 0 , ]$dir = "Negative"
+met = coefs
+
+#prot
+test = model_select(prot)
+coefs = as.data.frame(as.matrix(coef(prot$modlist[[test[1]]], s = test[2])))
+coefs = coefs[coefs$s1 != 0, , drop = F]
+coefs = coefs[rownames(coefs) != "(Intercept)", , drop = F]
+nrow(coefs) #246
+coefs = coefs[order(abs(coefs$s1), decreasing = T), , drop = F]
+coefs = coefs[1:20, , drop = F]
+coefs$name = NA
+for (x in 1:nrow(coefs)){
+  coefs$name[x] = protnames[protnames$seqID == rownames(coefs)[x], ]$Target
+}
+coefs$type = "Protein"
+coefs$dir = NA
+coefs[coefs$s1 > 0 , ]$dir = "Positive"
+coefs[coefs$s1 < 0 , ]$dir = "Negative"
+prot = coefs
+
+#trans
+test = model_select(rna)
+coefs = as.data.frame(as.matrix(coef(rna$modlist[[test[1]]], s = test[2])))
+coefs = coefs[coefs$s1 != 0, , drop = F]
+coefs = coefs[rownames(coefs) != "(Intercept)", , drop = F]
+nrow(coefs) #71
+coefs = coefs[order(abs(coefs$s1), decreasing = T), , drop = F]
+coefs = coefs[1:20, , drop = F]
+coefs$name = NA
+for (x in 1:nrow(coefs)){
+  coefs$name[x] = ctnames[ctnames$gene_id == rownames(coefs)[x], ]$gene_name
+}
+coefs$type = "Transcript"
+coefs$dir = NA
+coefs[coefs$s1 > 0 , ]$dir = "Positive"
+coefs[coefs$s1 < 0 , ]$dir = "Negative"
+rna = coefs
+
+#comb
+coefs = as.data.frame(as.matrix(coef(comb), s = "lambda.1se"))
+coefs = coefs[coefs$s1 != 0, , drop = F]
+coefs = coefs[rownames(coefs) != "(Intercept)", , drop = F]
+nrow(coefs) #1204. 
+coefs = coefs[order(abs(coefs$s1), decreasing = T), , drop = F]
+coefs = coefs[1:60, , drop = F]
+coefs$type = NA
+coefs$name = NA
+for (x in 1:nrow(coefs)){ 
+  if (rownames(coefs)[x] %in% ctnames$gene_id){
+    coefs$name[x] = ctnames[ctnames$gene_id == rownames(coefs)[x], ]$gene_name
+    coefs$type[x] = "Transcript"
+  }
+  if (rownames(coefs)[x] %in% metnames$metabid){
+    coefs$name[x] = metnames[metnames$metabid == rownames(coefs)[x], ]$CHEMICAL_NAME
+    coefs$type[x] = "Metabolite"
+  }
+  if (rownames(coefs)[x] %in% protnames$seqID){
+    coefs$name[x] = protnames[protnames$seqID == rownames(coefs)[x], ]$Target
+    coefs$type[x] = "Protein"
+  }
+}
+coefs$dir = NA
+coefs[coefs$s1 > 0 , ]$dir = "Positive"
+coefs[coefs$s1 < 0 , ]$dir = "Negative"
+comb = coefs
+
+
+#plot separately.
+comb$col = paste0(comb$type, comb$dir)
+e = ggplot(comb, aes(abs(s1), reorder(name, abs(s1)))) + 
+  geom_bar(stat = "identity", aes(fill = col)) +
+  labs(x = "Feature Weight", y = "", fill = "Direction", title = "Lung Density MultRS") +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("#F8766D", darken("#F8766D", .3), "#00BA38", darken("#00BA38", .3), "#619CFF", darken("#619CFF", .3)))
+
+f = ggplot(met, aes(abs(s1), reorder(name, abs(s1)))) + 
+  geom_bar(stat = "identity", aes(fill = dir)) +
+  labs(x = "Feature Weight", y = "", fill = "Direction", title = "MetRS") +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("#F8766D", darken("#F8766D", .3)))
+
+g = ggplot(prot, aes(abs(s1), reorder(name, abs(s1)))) + 
+  geom_bar(stat = "identity", aes(fill = dir)) +
+  labs(x = "Feature Weight", y = "", fill = "Direction", title = "ProtRS") +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("#00BA38", darken("#00BA38", .3)))
+
+h = ggplot(rna, aes(abs(s1), reorder(name, abs(s1)))) + 
+  geom_bar(stat = "identity", aes(fill = dir)) +
+  labs(x = "Feature Weight", y = "", fill = "Direction", title = "TransRS") +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("#619CFF", darken("#619CFF", .3)))
+
+one = cowplot::plot_grid(c, d, labels = c("a.", "b."), nrow = 1)
+two = cowplot::plot_grid(e, labels = c("c."))
+three = cowplot::plot_grid(f, g, h, nrow = 3, labels = c("d.", "e.", "f."))
+four = cowplot::plot_grid(two, three, rel_widths = c(1,1))
+
+png("C:/Users/konigsbi/Desktop/ors_topmed/April/Figures/Figure5.png", units = "in", res = 500, width = 10, height = 12)
+cowplot::plot_grid(one, four, nrow = 2, rel_heights = c(.3, 1))
+dev.off()
+
+```
+
+```{r}
+sub = full[full$class == "gaussian" | full$class == "log", ]
+
+ggplot(sub, aes(type, beta)) + 
+  geom_boxplot() +
+  geom_beeswarm()
+
+summary(aov(beta ~ type, full)) #1.96e-05 ***
+t.test(beta ~ type, full[full$type == "Combined" | full$type == "Metabolite", ]) #0.002118
+t.test(beta ~ type, full[full$type == "Combined" | full$type == "Protein", ]) #0.04066
+t.test(beta ~ type, full[full$type == "Combined" | full$type == "Transcript", ]) #0.0001172
+t.test(beta ~ type, full[full$type == "Protein" | full$type == "Metabolite", ]) #0.0584
+t.test(beta ~ type, full[full$type == "Protein" | full$type == "Transcript", ]) #0.001529
+t.test(beta ~ type, full[full$type == "Transcript" | full$type == "Metabolite", ]) #0.04657
+
+
+summary(aov(-log10(p) ~ type, full)) #0.00154 **
+
+```
+
+```{r}
+nrow(met[rownames(met) %in% rownames(comb), ]) 
+nrow(prot[rownames(prot) %in% rownames(comb), ]) 
+nrow(rna[rownames(rna) %in% rownames(comb), ]) 
+
+table(comb$type)
+```
+
+
+# Wrap-Up
+
+```{r}
+Sys.time() - start
+
+sessionInfo()
+```
+
+

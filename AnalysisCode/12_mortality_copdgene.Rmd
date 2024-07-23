@@ -1,0 +1,307 @@
+---
+title: "Mortality (& Figure 4)"
+author: "Iain R. Konigsberg"
+date: '`r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: true
+---
+
+# Background
+
+This Rmd contains code to evaluate mortality and longitudinal ORS. 
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = 'C:/Users/konigsbi/Desktop/ors_topmed/January/Results/mortality/')
+
+```
+
+mortality 
+
+```{r, message=F}
+library(survival)
+library(survminer)
+library(caret)
+library(glmnet)
+library(glmnetUtils)
+library(dplyr)
+library(gtsummary)
+
+setwd("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/mortality/")
+
+set.seed(11)
+theme_set(theme_bw())
+
+start = Sys.time()
+
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  max_measure = df[df$measure == max(df$measure), ]$measure
+  se_measure = df[df$measure == max(df$measure), ]$se
+  sub_df = df[df$measure <= max_measure - se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic))
+}
+
+```
+
+
+
+https://search.r-project.org/CRAN/refmans/survminer/html/ggsurvplot.html
+```{r}
+pd = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/pd_main_overlap.csv", row.names = 1)
+cox = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/COPDGene_VitalStatus_SM_NS_Oct22.csv", row.names = 1)
+pd = merge(pd, cox, by.x = "sid", by.y = "row.names")
+pd$days_adjusted = pd$days_followed - pd$days_since_baseline_P2
+pd = pd[pd$days_adjusted > 0, ]
+
+pd_old = pd
+pd = pd %>% dplyr::select(sid, vital_status, days_adjusted, BODE_P2, Age_P2, gender, race, ccenter_P2, smoking_status_P2, ATS_PackYears_P2)
+pd$bode = NA
+pd[!is.na(pd$BODE_P2) & (pd$BODE_P2 == 0 | pd$BODE_P2 == 1 | pd$BODE_P2 == 2), ]$bode = 1
+pd[!is.na(pd$BODE_P2) & (pd$BODE_P2 == 3 | pd$BODE_P2 == 4), ]$bode = 2
+pd[!is.na(pd$BODE_P2) & (pd$BODE_P2 == 5 | pd$BODE_P2 == 6), ]$bode = 3
+pd[!is.na(pd$BODE_P2) & (pd$BODE_P2 == 7 | pd$BODE_P2 == 8 | pd$BODE_P2 == 9 | pd$BODE_P2 == 10), ]$bode = 4
+
+
+prot = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/Proteome/ProcessedProteins.rds")
+met = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/Metabolome/ProcessedMetabolites.rds")
+met = met %>% dplyr::select(!where(~all(.x %in% 0:1))) #remove binary features. 
+cts = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/Transcriptome/ProcessedNormalizedCounts.rds")
+
+rownames(pd) = pd$sid
+pd = pd[order(rownames(pd)), ]
+
+prot = prot[rownames(prot) %in% rownames(pd), ] 
+met = met[rownames(met) %in% rownames(pd), ]
+cts = cts[, colnames(cts) %in% rownames(pd), ]
+
+prot = log(prot + 1)
+met = log(met + 1)
+
+prot = prot[order(rownames(prot)), ]
+met = met[order(rownames(met)), ]
+cts = cts[, order(colnames(cts)) ]
+cts = t(cts)
+
+all(rownames(prot) == rownames(pd))
+all(rownames(met) == rownames(pd))
+all(rownames(cts) == rownames(pd))
+
+#splits
+train_ids = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/train_ids_80_20.rds")
+test_ids = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/test_ids_80_20.rds")
+
+#produce preds
+
+y_test = pd[pd$sid %in% test_ids, ]
+
+
+mod_trans = readRDS("model_transcript_mortality.rds")
+mod_prot = readRDS("model_protein_mortality.rds")
+mod_met = readRDS("model_metabolite_mortality.rds")
+
+
+param_trans = model_select(mod_trans)
+param_prot = model_select(mod_prot)
+param_met = model_select(mod_met)
+
+
+
+#PROT
+x_test = as.matrix(prot[rownames(prot) %in% rownames(y_test), ])
+lp <- predict(mod_prot$modlist[[param_prot[1]]],
+              newx=x_test,
+              s=param_prot[2],
+              type="link") 
+lp = as.data.frame(lp)
+names(lp) = "s1"
+dat.test <- data.frame(y_test)
+dat.test$score = lp$s1
+dat.test$quant = ntile(lp$s1, 4)
+survdiff(Surv(days_adjusted, vital_status) ~ quant, dat.test) #p= <2e-16 . 1.820019e-23
+survdiff(Surv(days_adjusted, vital_status) ~ bode, dat.test) #p= <2e-16 . 2.667476e-23
+fit.surv <- survfit(Surv(days_adjusted, vital_status) ~ quant, data = dat.test)
+a = ggsurvplot(fit.surv,conf.int = TRUE, pval = T, risk.table = T, legend.labs = c(" 1", " 2", " 3", " 4"))
+
+dat.test = dat.test[!is.na(dat.test$bode), ]
+fit1 <- coxph(Surv(days_adjusted, vital_status) ~ score + bode + Age_P2 + gender + race + ccenter_P2 + smoking_status_P2 + ATS_PackYears_P2, data = dat.test)
+fit2 <- coxph(Surv(days_adjusted, vital_status) ~ bode + Age_P2 + gender + race + ccenter_P2 + smoking_status_P2 + ATS_PackYears_P2, data = dat.test)
+anova(fit1, fit2) #1.552e-10
+
+
+#MET
+x_test = as.matrix(met[rownames(met) %in% rownames(y_test), ])
+lp <- predict(mod_met$modlist[[param_met[1]]],
+              newx=x_test,
+              s=param_met[2],
+              type="link") 
+lp = as.data.frame(lp)
+names(lp) = "s1"
+dat.test <- data.frame(y_test)
+dat.test$score = lp$s1
+dat.test$quant = ntile(lp$s1, 4)
+survdiff(Surv(days_adjusted, vital_status) ~ quant, dat.test) #p= 3e-13 
+survdiff(Surv(days_adjusted, vital_status) ~ bode, dat.test)$pvalue #p= 2.667476e-23
+
+fit.surv <- survfit(Surv(days_adjusted, vital_status) ~ quant, data = dat.test)
+b = ggsurvplot(fit.surv,conf.int = TRUE, pval = T, risk.table = T, legend.labs = c(" 1", " 2", " 3", " 4")) 
+
+dat.test = dat.test[!is.na(dat.test$bode), ]
+fit1 <- coxph(Surv(days_adjusted, vital_status) ~ score + bode + Age_P2 + gender + race + ccenter_P2 + smoking_status_P2 + ATS_PackYears_P2, data = dat.test)
+fit2 <- coxph(Surv(days_adjusted, vital_status) ~ bode + Age_P2 + gender + race + ccenter_P2 + smoking_status_P2 + ATS_PackYears_P2, data = dat.test)
+anova(fit1, fit2) #0.001189
+
+
+#TRANS
+x_test = as.matrix(cts[rownames(cts) %in% rownames(y_test), ])
+lp <- predict(mod_trans$modlist[[param_trans[1]]],
+              newx=x_test,
+              s=param_trans[2],
+              type="link") 
+lp = as.data.frame(lp)
+names(lp) = "s1"
+dat.test <- data.frame(y_test)
+dat.test$score = lp$s1
+dat.test$quant = ntile(lp$s1, 4)
+survdiff(Surv(days_adjusted, vital_status) ~ quant, dat.test) #p= 6e-05 
+survdiff(Surv(days_adjusted, vital_status) ~ bode, dat.test) #p= 2.667476e-23
+
+fit.surv <- survfit(Surv(days_adjusted, vital_status) ~ quant, data = dat.test)
+c = ggsurvplot(fit.surv,conf.int = TRUE, pval = T, risk.table = T, legend.labs = c(" 1", " 2", " 3", " 4"))
+
+dat.test = dat.test[!is.na(dat.test$bode), ]
+fit1 <- coxph(Surv(days_adjusted, vital_status) ~ score + bode + Age_P2 + gender + race + ccenter_P2 + smoking_status_P2 + ATS_PackYears_P2, data = dat.test)
+fit2 <- coxph(Surv(days_adjusted, vital_status) ~ bode + Age_P2 + gender + race + ccenter_P2 + smoking_status_P2 + ATS_PackYears_P2, data = dat.test)
+anova(fit1, fit2) #0.03498
+
+
+#update p plotting (more accurate)
+#scale down all sizes. titles, axes way too large.... just did theme_classic() maybe try theme_minimal()
+a$plot = a$plot + theme_classic() + theme(legend.position = "none") + labs(title = "ProtRS")
+b$plot = b$plot + theme_classic() + theme(legend.position = "none") + labs(title = "MetRS")
+c$plot = c$plot + theme_classic() + theme(legend.position = "none") + labs(title = "TransRS")
+
+two = cowplot::plot_grid(a$plot, b$plot , c$plot, labels = c("c.", "d.", "e."), nrow = 1) 
+
+
+```
+strata dont look super great to me.....
+
+
+plotting
+```{r}
+full = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/COPDGene_testing_results.csv", row.names = 1)
+
+full$pheno = gsub("_P2", "", full$pheno)
+full$pheno = gsub("_P3", "", full$pheno)
+full$pheno = gsub("distwalked", "6MW Distance", full$pheno)
+full$pheno = gsub("Resting_SaO2", "SaO2", full$pheno)
+full$pheno = gsub("finalGold", "GOLD Stage", full$pheno)
+full$pheno = gsub("FEV1_FVC_post", "FEV1/FVC", full$pheno)
+full$pheno = gsub("FEV1_post", "FEV1", full$pheno)
+full$pheno = gsub("FVC_post", "FVC", full$pheno)
+full$pheno = gsub("AWT_seg_Thirona", "Airway Wall Thickness", full$pheno)
+full$pheno = gsub("lung_density_vnb", "Lung Density", full$pheno)
+full$pheno = gsub("pctGasTrap_Thirona", "Gas Trapping", full$pheno)
+full$pheno = gsub("pctEmph_Thirona", "Emphysema", full$pheno)
+full$pheno = gsub("Exacerbation_Frequency", "Exacerbation Frequency", full$pheno)
+full$pheno = gsub("Chronic_Bronchitis", "Chronic Bronchitis", full$pheno)
+full$pheno = gsub("copd", "COPD", full$pheno)
+full$pheno = gsub("Severe_Exacerbations", "Exacerbations (y/n)", full$pheno)
+full$pheno = gsub("Change_6MW Distance", "6MW Distance Change", full$pheno)
+full$pheno = gsub("Change_FEV1_ml_yr", "FEV1 Change (ml/yr)", full$pheno)
+full$pheno = gsub("Change_FEV1_ml", "FEV1 Change (ml)", full$pheno)
+full$pheno = gsub("Change_FEV1pp", "FEV1 Change (% predicted)", full$pheno)
+full$pheno = gsub("Change_Airway Wall Thickness", "Airway Wall Thickness", full$pheno)
+full$pheno = gsub("Change_FRC_TLC_ratio_Thirona", "FRC/TLC Change", full$pheno)
+full$pheno = gsub("Change_Gas Trapping", "Gas Trapping Change", full$pheno)
+full$pheno = gsub("Change_Pi10_Thirona", "Pi10 Change", full$pheno)
+full$pheno = gsub("Change_WallAreaPct_seg_Thirona", "Wall Area Percent Change", full$pheno)
+full$pheno = gsub("Change_Lung Density", "Lung Density Change", full$pheno)
+
+
+full_change = full[grep("Change", rownames(full)), ]
+full_change = full_change[full_change$pheno != "Airway Wall Thickness", ]
+
+#new. cuz im worried about reduced dose. nah wait for now. 
+full_change = full_change[full_change$pheno != "FRC/TLC Change", ]
+full_change = full_change[full_change$pheno != "Gas Trapping Change", ]
+full_change = full_change[full_change$pheno != "Pi10 Change", ]
+full_change = full_change[full_change$pheno != "Wall Area Percent Change", ]
+
+write.csv(full_change, "C:/Users/konigsbi/Desktop/ors_topmed/manuscript/Supplement/Full_longi_forSupp.csv")
+
+
+#change vars
+ca = ggplot(full_change, aes(beta, factor(pheno, levels = rev(levels(factor(pheno)))), alpha = sig, group = type, color = type)) + 
+  geom_point(position = position_dodge(width = .5)) + 
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") + 
+  geom_errorbar(aes(xmin = beta.lo, xmax = beta.hi), width = 0, position = position_dodge(width = .5)) + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+  labs(x = "\u03b2 Coefficient", y = "", color = "") + 
+  scale_alpha_manual(values = c(0.3, 1)) +
+  guides(alpha = "none")
+
+
+cb = ggplot(full_change) + 
+  geom_bar(aes(rsq.full, pheno, fill = type, alpha = sig), stat = "identity", position = "dodge") + 
+  geom_bar(aes(rsq.null, pheno), stat = "identity", position = "dodge") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  labs(x = bquote("Adjusted R"^2), y = "", fill = "") +
+  scale_y_discrete(limits = rev(levels(factor(full_change$pheno)))) + 
+  scale_alpha_manual(values = c(0.3, 1)) +
+  guides(alpha = "none") +
+  xlim(0, 0.25) +
+  scale_x_continuous(n.breaks = 4)
+
+
+one = cowplot::plot_grid(ca, cb, labels = c("a.", "b."))
+
+
+
+
+png("C:/Users/konigsbi/Desktop/ors_topmed/April/Figures/Figure4.png", units = "in", height = 6, width = 8, res = 500)
+cowplot::plot_grid(one, two, nrow = 2, rel_heights = c(1, .7))
+dev.off()
+
+```
+
+# Wrap-Up
+
+```{r}
+Sys.time() - start
+
+sessionInfo()
+```
+

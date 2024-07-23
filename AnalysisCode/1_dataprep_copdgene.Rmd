@@ -1,0 +1,147 @@
+---
+title: "COPDGene Data Preparation"
+author: "Iain R. Konigsberg"
+date: '`r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: true
+---
+
+# Background
+
+This Rmd contains code to prepare COPDGene proteomics, metabolomics, proteomics, and phenotype data for ORS construction. 
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = 'C:/Users/konigsbi/Desktop/ors_topmed/')
+
+```
+
+
+```{r libraries}
+library(data.table)
+
+setwd("C:/Users/konigsbi/Desktop/ors_topmed/")
+set.seed(11)
+
+start = Sys.time()
+```
+
+# Phenotype Data
+
+```{r}
+pd = as.data.frame(fread("Data/COPDGene/COPDGene_P1P2P3_Flat_SM_NS_Oct23.txt"))
+pd = pd[!is.na(pd$Age_P2), ]
+
+pd_ild = read.csv("Data/COPDGene/COPDGene_P1P2P3_ILDBR_Long_Oct22.csv")
+pd_controls = pd[pd$cohort == "Never smoked", ]
+
+#subset pd to samps of interest
+pd = pd[pd$cohort == "Smoker", ]
+
+#remove lung transplants
+pd = pd[pd$Exclude_LungTrans_LVRS_P2 == 0, ]
+
+rownames(pd) = pd$sid
+
+write.csv(pd, "pd_main.csv")
+```
+
+# Transcriptome
+```{r eval=T}
+cts = fread("Data/COPDGene/Transcriptome/log-CPM_from_scaledTPM_LC.tsv")
+cts = as.data.frame(cts)
+rownames(cts) = cts[,1]
+cts = cts[,2:ncol(cts)]
+
+cts = cts[, colnames(cts) %in% pd$sid | colnames(cts) %in% pd_ild$sid | colnames(cts) %in% pd_controls$sid]
+
+dim(cts[, colnames(cts) %in% pd$sid])
+
+saveRDS(cts, "Data/COPDGene/Transcriptome/ProcessedNormalizedCounts.rds")
+```
+
+# Proteome
+
+```{r eval=T}
+prot = as.data.frame(fread("Data/COPDGene/Proteome/copdg_soma_5k_p2_13may21.txt"))
+rownames(prot) = prot[,1]
+prot = prot[,2:ncol(prot)]
+
+prot = prot[rownames(prot) %in% pd$sid | rownames(prot) %in% pd_ild$sid | rownames(prot) %in% pd_controls$sid, ]
+
+dim(prot[rownames(prot) %in% pd$sid, ]) #
+
+colnames(prot) = gsub("X", "", colnames(prot))
+saveRDS(prot, "Data/COPDGene/Proteome/ProcessedProteins.rds")
+```
+
+# Metabolome
+
+```{r eval=T}
+met1 = readRDS("Data/COPDGene/Metabolome/COPDGene_P2_Metabolites_2080_Imputed_NoOut.rds")
+met2 = readRDS("Data/COPDGene/Metabolome/COPDGene_P2_Metabolites_lt20_Imputed_NoOut.rds")
+
+met1$visitnum = NULL
+rownames(met1) = met1$sid
+met1$sid = NULL
+
+met2$visitnum = NULL
+rownames(met2) = met2$sid
+met2$sid = NULL
+
+met = cbind(met1, met2)
+
+#combine with ildbr. 
+met1 = readRDS("Data/COPDGene/Metabolome/COPDGene_P2_ILDBR_Metabolites_2080_Imputed_NoOut.rds")
+met2 = readRDS("Data/COPDGene/Metabolome/COPDGene_P2_ILDBR_Metabolites_lt20_Imputed_NoOut.rds")
+
+met1$visitnum = NULL
+rownames(met1) = met1$sid
+met1$sid = NULL 
+
+met2$visitnum = NULL
+rownames(met2) = met2$sid
+met2$sid = NULL 
+
+met2 = cbind(met1, met2)
+
+met = rbind(met, met2) 
+
+met = met[rownames(met) %in% pd$sid | rownames(met) %in% pd_ild$sid | rownames(met) %in% pd_controls$sid, ]
+
+dim(met[rownames(met) %in% pd$sid, ]) #5404
+
+saveRDS(met, "Data/COPDGene/Metabolome/ProcessedMetabolites.rds")
+```
+
+# Save Phenotype Data for Overlapping Subjects
+
+```{r}
+met2 = met[rownames(met) %in% rownames(pd), ] 
+prot2 = prot[rownames(prot) %in% rownames(pd), ] 
+cts2 = cts[,colnames(cts) %in% rownames(pd) ] 
+
+met2 = met2[rownames(met2) %in% rownames(prot2), ]
+met2 = met2[rownames(met2) %in% colnames(cts2), ] 
+
+pd_sub = pd[pd$sid %in%rownames(met2) & pd$sid %in% rownames(prot2) & pd$sid %in% colnames(cts2),]
+nrow(pd_sub)
+write.csv(pd_sub, "pd_main_overlap.csv")
+```
+
+# Wrap-Up
+
+```{r wrapup}
+Sys.time() - start
+
+sessionInfo()
+```
+

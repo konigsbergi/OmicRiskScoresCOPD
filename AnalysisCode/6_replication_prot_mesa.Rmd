@@ -1,0 +1,309 @@
+---
+title: "Proteomic Risk Score Replication in MESA"
+author: "Iain R. Konigsberg"
+date: '`r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: true
+---
+
+# Background
+
+This Rmd contains code to apply proteomic risk score models to MESA participants (n = XXX). 
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/konigsbi/Desktop/ors_topmed/")
+```
+
+reconsider covars
+
+Mesa Protein Exam1
+
+```{r message=F}
+library(ggplot2)
+library(glmnetUtils)
+library(data.table)
+library(readxl)
+library(sjPlot)
+library(dplyr)
+
+setwd("C:/Users/konigsbi/Desktop/ors_topmed/")
+
+start = Sys.time()
+
+theme_set(theme_bw())
+set.seed(11)
+
+replicate = function(omics, model, lambda = "lambda.min"){
+  weights = as.data.frame(as.matrix(coef(model, s = lambda)))
+  weights$dummy = NA
+  weights = weights[weights$s1 != 0, ]
+  print(paste0("Number of Non-Zero model weights: ", nrow(weights) - 1))
+  print(paste0("Number of Non-Zero model weights in replication sample: ", nrow(weights[rownames(weights) %in% colnames(omics), ])))
+  
+  inty = weights$s1[1]
+  weights = weights[2:nrow(weights), ]
+  
+  weights = weights[rownames(weights) %in% colnames(omics), ]
+  omics_sub = omics[, colnames(omics) %in% rownames(weights)]
+  
+  weights = weights[order(rownames(weights)), ]
+  omics_sub = omics_sub[, order(colnames(omics_sub))]
+  
+  print(paste0("Model Weights & Omics Line Up: ", all(rownames(weights) == colnames(omics_sub))))
+  omics_sub = t(omics_sub)
+  
+  scores = as.data.frame(t(weights$s1 %*% as.matrix(omics_sub) + inty)) 
+  names(scores) = "score"
+  return(scores)
+}
+
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic))
+}
+
+```
+
+# Prepare Proteins
+
+pd & prot prep
+```{r}
+pd = fread("Data/MESA/SHARe Phenotype Datasets/MESAExam1_5/SHARe_Exam1Main.txt") #6431
+pd = as.data.frame(pd) %>% dplyr::select(sidno, age1c, race1c, gender1, site1c, bmi1c, pkyrs1c, cig1c, htcm1)
+pd2 = fread("Data/MESA/SHARe Phenotype Datasets/MESAExam1_5/SHARe_Exam5Main.txt")
+pd2 = as.data.frame(pd2) %>% dplyr::select(sidno, age5c, site5c, bmi5c, pkyrs5c, cig5c, htcm5)
+pd = merge(pd, pd2, by = "sidno", all = T)
+#should take note of exclusions
+spiro = as.data.frame(fread("Data/MESA/SHARe Phenotype Datasets/Lung/SHARe_AncilMesaLungSpirometryExam5.txt")) 
+spiro = spiro %>% dplyr::select(sidno, fev1ab5, fvcab5, fevfvcab5, cpgoldab5, cpstgab5, f2575ab5, pefab5)
+pd = merge(pd, spiro, by = "sidno", all = T)
+ct = as.data.frame(fread("Data/MESA/SHARe Phenotype Datasets/Lung/SHARe_AncilMesaLungExam1CT.txt")) #6425. 3853 w/ exam1 scans.  
+ct = ct %>% dplyr::select(sidno, B_tot_vx, B_be_950, model) 
+ct$pctemph = ct$B_be_950/ct$B_tot_vx #needs to be log transformed for analysis. 
+pd = merge(pd, ct, by = "sidno", all = T)
+airway = as.data.frame(fread("Data/MESA/SHARe Phenotype Datasets/Lung/SHARe_AncilMesaLungAirway.txt"))
+airway = airway %>% dplyr::select(sidno, wall_thickness, wa_pct)
+pd = merge(pd, airway, by = "sidno", all = T)
+
+dim(pd) #6498
+
+protnames = read.csv("Data/COPDGene/Proteome/copdg_soma_5k_p2_metadata_Jun21.csv")
+
+prot = as.data.frame(read_excel("Data/MESA/Proteomics/proteomics_data_merged_with_runlist_key_updated_mar1.xlsx", skip = 7))
+prot = prot[prot$RowCheck == "PASS", ] #filtering out failing samps. 1966 -> 1954
+topmed = as.data.frame(read_excel("Data/MESA/MESA_TOPMed_WideID_20190517.xlsx", skip = 2))
+topmed = topmed %>% dplyr::select(sidno, top_id1, top_id5)
+
+prot_one = prot[prot$TOP_ID %in% topmed$top_id1, ] #978
+prot_five = prot[prot$TOP_ID %in% topmed$top_id5, ] #976
+rownames(prot_one) = prot_one$sidno
+rownames(prot_five) = prot_five$sidno
+
+prot_one = prot_one[, 33:ncol(prot_one)]
+prot_five = prot_five[, 33:ncol(prot_five)]
+
+table(colnames(prot_one) %in% protnames$SOMAID) #1255 t, 62 f
+table(protnames$SOMAID %in% colnames(prot_one)) #3653 F, 1326 T. so small subset. 
+
+
+#convert prot colnames from SOMAID to seqID
+for (x in 1:ncol(prot_one)){
+  if (colnames(prot_one)[x] %in% protnames$SOMAID){
+    colnames(prot_one)[x] = protnames[protnames$SOMAID == colnames(prot_one)[x], ]$seqID
+}}
+
+for (x in 1:ncol(prot_five)){
+  if (colnames(prot_five)[x] %in% protnames$SOMAID){
+    colnames(prot_five)[x] = protnames[protnames$SOMAID == colnames(prot_five)[x], ]$seqID
+}}
+
+#shouldnt i log?
+prot_one = log(prot_one + 1)
+prot_five = log(prot_five + 1)
+
+
+```
+
+# Calculate ProtRS
+
+## Exam1
+```{r}
+#emphysema
+file = "January/Results/models_copdgene/model_protein_pctEmph_Thirona_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(prot_one, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(log(test$pctemph) ~ test$score + test$age1c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig1c) + test$pkyrs1c + test$bmi1c + test$model)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"]  #0.08416784
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("January/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("January/Results/predictions_mesa/", file, "_prediction_Exam1omics.rds"))  
+
+```
+
+## Exam 5
+```{r}
+#FEV1_P2  
+file = "January/Results/models_copdgene/model_protein_FEV1_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(prot_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$fev1ab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"] #3.518191e-06
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("January/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("January/Results/predictions_mesa/", file, "_predictions_Exam5omics.rds"))  
+  
+#Fvc_P2  
+file = "January/Results/models_copdgene/model_protein_FVC_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(prot_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$fvcab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"] #2.300829e-07
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("January/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("January/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+  
+#Fev/fvc_P2  
+file = "January/Results/models_copdgene/model_protein_FEV1_FVC_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(prot_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$fevfvcab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"] #0.01266752
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("January/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("January/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+  
+#finalgold_p2
+file = "January/Results/models_copdgene/model_protein_finalGold_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(prot_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$cpstgab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"] #0.09785782
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("January/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("January/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+  
+#copd_p2
+  file = "January/Results/models_copdgene/model_protein_copd_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(prot_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = glm(as.factor(test$cpgoldab5) ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c, family = "binomial")
+  summary(test2)$coefficients["test$score", "Pr(>|z|)"] #0.02294573
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("January/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("January/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))
+
+#wa_pct.
+file = "January/Results/models_copdgene/model_protein_WallAreaPct_seg_Thirona_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(prot_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$wa_pct ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$model)
+  summary(test2)[[4]][2,4]   #0.001236539
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("January/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("January/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+
+#f2575ab5
+file = "January/Results/models_copdgene/model_protein_FEF2575_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(prot_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$f2575ab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)[[4]][2,4] #0.0009894681
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("January/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("January/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+
+#pefab5
+file = "January/Results/models_copdgene/model_protein_PEF_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(prot_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$pefab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)[[4]][2,4] #3.774477e-05
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("January/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("January/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+
+
+
+
+```
+
+# Wrap-Up
+
+```{r}
+Sys.time() - start
+
+sessionInfo()
+```
+
+

@@ -1,0 +1,224 @@
+---
+title: "COPDGene Prediction"
+author: "Iain R. Konigsberg"
+date: '`r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: true
+---
+
+# Background
+
+This Rmd contains code to apply ORS models to COPDGene testset participants (n = 715). 
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = F)
+knitr::opts_chunk$set(warning = F)
+
+knitr::opts_knit$set(root.dir = "C:/Users/konigsbi/Desktop/ors_topmed/")
+```
+
+```{r}
+library(caret)
+library(glmnet)
+library(glmnetUtils)
+library(dplyr)
+library(doParallel)
+library(MASS) #for negative binomial modeling
+
+setwd("C:/Users/konigsbi/Desktop/ors_topmed/")
+
+set.seed(11)
+
+start = Sys.time()
+
+```
+
+```{r}
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic))
+}
+```
+
+# Prepare Data
+
+```{r}
+#formatting
+pd = read.csv("Data/COPDGene/pd_main_overlap.csv", row.names = 1)
+
+#removing prism since not defined in other studies
+pd[!is.na(pd$finalGold_P2) & pd$finalGold_P2 == -1, ]$finalGold_P2 = NA
+pd$GoldCategory_P2 = as.factor(pd$finalGold_P2)
+
+pd$copd_P2 = NA
+pd[!is.na(pd$FEV1_FVC_post_P2) & pd$FEV1_FVC_post_P2 < .7, ]$copd_P2 = 1
+pd[!is.na(pd$FEV1_FVC_post_P2) & pd$FEV1_FVC_post_P2 > .7, ]$copd_P2 = 0
+
+pd$Change_P2_P3_FRC_TLC_ratio_Thirona = pd$FRC_TLC_ratio_Thirona_P3 - pd$FRC_TLC_ratio_Thirona_P2 
+pd$Change_P2_P3_pctGasTrap_Thirona = pd$pctGasTrap_Thirona_P3 - pd$pctGasTrap_Thirona_P2 
+pd$Change_P2_P3_lung_density_vnb = pd$lung_density_vnb_P3 - pd$lung_density_vnb_P2
+pd$Change_P2_P3_Pi10_Thirona = pd$Pi10_Thirona_P3 - pd$Pi10_Thirona_P2
+pd$Change_P2_P3_AWT_seg_Thirona = pd$AWT_seg_Thirona_P3 - pd$AWT_seg_Thirona_P2
+pd$Change_P2_P3_WallAreaPct_seg_Thirona = pd$WallAreaPct_seg_Thirona_P3 - pd$WallAreaPct_seg_Thirona_P2
+
+#add new vars
+
+num_vars = c("Change_P2_P3_distwalked", "Change_P2_P3_FEV1_ml", "Change_P2_P3_FEV1_ml_yr", 
+             "Change_P2_P3_FEV1pp", "AWT_seg_Thirona_P2", "distwalked_P2", "FEV1_FVC_post_P2",  
+             "FEV1_post_P2", "FVC_post_P2", "lung_density_vnb_P2", "Resting_SaO2_P2", "finalGold_P2", 
+             "Change_P2_P3_FRC_TLC_ratio_Thirona", "Change_P2_P3_pctGasTrap_Thirona", "Change_P2_P3_lung_density_vnb", 
+             "Change_P2_P3_Pi10_Thirona", "Change_P2_P3_AWT_seg_Thirona", "Change_P2_P3_WallAreaPct_seg_Thirona", "PEF_post_P2", "FRC_TLC_ratio_Thirona_P2", "WallAreaPct_seg_Thirona_P2", "DLco_raw_P2", "FEF2575_post_P2")
+log_vars = c("pctEmph_Thirona_P2", "pctGasTrap_Thirona_P2", "TLC_Thirona_P2", "FRC_Thirona_P2", "Pi10_Thirona_P2")
+negbinom_vars = c("Exacerbation_Frequency_P2", "SGRQ_scoreTotal_P2", "BODE_P2")
+bin_vars = c("copd_P2", "Severe_Exacerbations_P2", "smoking_status_P2", "Chronic_Bronchitis_P2") 
+
+pd = pd %>% dplyr::select(sid, all_of(num_vars), all_of(log_vars), all_of(bin_vars), all_of(negbinom_vars))
+
+```
+
+```{r}
+prot = readRDS("Data/COPDGene/Proteome/ProcessedProteins.rds")
+met = readRDS("Data/COPDGene/Metabolome/ProcessedMetabolites.rds") 
+met = met %>% dplyr::select(!where(~all(.x %in% 0:1)))
+cts = readRDS("Data/COPDGene/Transcriptome/ProcessedNormalizedCounts.rds")
+
+prot = log(prot + 1)
+met = log(met + 1)
+
+rownames(pd) = pd$sid
+pd = pd[order(rownames(pd)), ]
+
+prot = prot[rownames(prot) %in% rownames(pd), ] 
+met = met[rownames(met) %in% rownames(pd), ]
+cts = cts[,colnames(cts) %in% rownames(pd)]
+
+prot = prot[order(rownames(prot)), ]
+met = met[order(rownames(met)), ]
+cts = cts[, order(colnames(cts)) ]
+cts = t(cts)
+
+all(rownames(prot) == rownames(pd))
+all(rownames(met) == rownames(pd))
+all(rownames(cts) == rownames(pd))
+
+```
+
+# Calculate ORS
+
+```{r}
+
+#splits
+test_ids = readRDS("Data/COPDGene/test_ids_80_20.rds")
+
+##
+
+pred_linear = function(var, dat, ome){
+  print(var)
+  mod = readRDS(paste0("January/Results/models_copdgene/model_", ome, "_", var, ".rds"))
+  moddy = model_select(mod)
+  alpha = moddy[3]
+  print(alpha)
+  lambda = moddy[2]
+  y_test = pd[pd$sid %in% test_ids, ]
+  x_test = as.matrix(dat[rownames(dat) %in% rownames(y_test), ])
+  y_test = eval(parse(text = paste0("y_test$", var)))     
+  #pred with best model
+  pred = predict(mod, newx = x_test, alpha = alpha, s = lambda) 
+  pred_df = as.data.frame(cbind(pred, y_test))
+  
+  saveRDS(pred_df, paste0("January/Results/predictions_copdgene/predictions_", ome, "_elastic_", var, ".rds"))
+}
+
+pred_log = function(var, dat, ome){
+  print(var)
+  mod = readRDS(paste0("January/Results/models_copdgene/model_", ome, "_", var, ".rds"))
+  moddy = model_select(mod)
+  alpha = moddy[3]
+  print(alpha)
+  lambda = moddy[2]
+  y_test = pd[pd$sid %in% test_ids, ]
+  x_test = as.matrix(dat[rownames(dat) %in% rownames(y_test), ])
+  y_test = log(eval(parse(text = paste0("y_test$", var))))   
+  #pred with best model
+  pred = predict(mod, newx = x_test, alpha = alpha, s = lambda) 
+  pred_df = as.data.frame(cbind(pred, y_test))
+  
+  saveRDS(pred_df, paste0("January/Results/predictions_copdgene/predictions_", ome, "_elastic_", var, ".rds"))
+}
+
+pred_class = function(var, dat, ome){
+  print(var)
+  mod = readRDS(paste0("January/Results/models_copdgene/model_", ome, "_", var, ".rds"))
+  moddy = model_select(mod)
+  alpha = moddy[3]
+  print(alpha)
+  lambda = moddy[2]
+  y_test = pd[pd$sid %in% test_ids, ]
+  x_test = as.matrix(dat[rownames(dat) %in% rownames(y_test), ])
+  y_test = eval(parse(text = paste0("y_test$", var)))     
+  #pred with best model
+  pred = predict(mod, newx = x_test, alpha = alpha, s = lambda) 
+  pred_df = as.data.frame(cbind(pred, y_test))
+  
+  saveRDS(pred_df, paste0("January/Results/predictions_copdgene/predictions_", ome, "_elastic_", var, ".rds"))
+}
+
+lapply(num_vars, pred_linear, prot, "protein")
+lapply(num_vars, pred_linear, met, "metabolite")  
+lapply(num_vars, pred_linear, cts, "transcript")
+
+lapply(negbinom_vars, pred_linear, prot, "protein")
+lapply(negbinom_vars, pred_linear, met, "metabolite")
+lapply(negbinom_vars, pred_linear, cts, "transcript")
+
+lapply(log_vars, pred_log, prot, "protein")
+lapply(log_vars, pred_log, met, "metabolite")
+lapply(log_vars, pred_log, cts, "transcript")
+
+lapply(bin_vars, pred_class, prot, "protein") 
+lapply(bin_vars, pred_class, met, "metabolite") 
+lapply(bin_vars, pred_class, cts, "transcript")
+```
+
+# Wrap-Up
+
+```{r}
+Sys.time() - start
+
+sessionInfo()
+```

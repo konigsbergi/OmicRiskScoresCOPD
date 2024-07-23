@@ -1,0 +1,1767 @@
+---
+title: "COPDGene Evaluation"
+author: "Iain R. Konigsberg"
+date: '`r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: true
+---
+
+# Background
+
+This Rmd contains code to evaluate ORS in COPDGene testset participants. 
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+knitr::opts_chunk$set(message = F)
+knitr::opts_chunk$set(warning = F)
+
+knitr::opts_knit$set(root.dir = 'C:/Users/konigsbi/Desktop/ors_topmed/January/Results/predictions_copdgene/')
+```
+
+```{r message=F}
+library(dplyr)
+library(ggpubr)
+library(stringr)
+library(tidyr)
+library(sjPlot)
+library(MASS)
+library(rsq)
+library(pROC)
+library(glmnet)
+library(glmnetUtils)
+library(ggbeeswarm)
+library(ggrepel)
+
+theme_set(theme_bw())
+
+set.seed(11)
+
+start = Sys.time()
+
+setwd("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/predictions_copdgene/")
+files = dir()
+
+files = files[grep("predictions", files)]
+
+#remove p3 scores. 
+#files = files[grep("P2", files)]
+#keeping for phenos
+
+#removing gold category as wrong size files...
+files = files[-grep("GoldCategory", files)]
+
+
+start = Sys.time()
+```
+
+# Prep Phenotype Data
+
+```{r}
+pd = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/Data/COPDGene/pd_main_overlap.csv", row.names = 1)
+
+#removing prism since not defined in other studies
+pd[!is.na(pd$finalGold_P2) & pd$finalGold_P2 == -1, ]$finalGold_P2 = NA
+pd$GoldCategory_P2 = as.factor(pd$finalGold_P2)
+
+pd$copd_P2 = NA
+pd[!is.na(pd$FEV1_FVC_post_P2) & pd$FEV1_FVC_post_P2 < .7, ]$copd_P2 = 1
+pd[!is.na(pd$FEV1_FVC_post_P2) & pd$FEV1_FVC_post_P2 > .7, ]$copd_P2 = 0
+
+pd$copd_P3 = NA
+pd[!is.na(pd$FEV1_FVC_post_P3) & pd$FEV1_FVC_post_P3 < .7, ]$copd_P3 = 1
+pd[!is.na(pd$FEV1_FVC_post_P3) & pd$FEV1_FVC_post_P3 > .7, ]$copd_P3 = 0
+
+
+pd$Change_P2_P3_FRC_TLC_ratio_Thirona = pd$FRC_TLC_ratio_Thirona_P3 - pd$FRC_TLC_ratio_Thirona_P2 
+pd$Change_P2_P3_pctGasTrap_Thirona = pd$pctGasTrap_Thirona_P3 - pd$pctGasTrap_Thirona_P2 
+pd$Change_P2_P3_lung_density_vnb = pd$lung_density_vnb_P3 - pd$lung_density_vnb_P2
+pd$Change_P2_P3_Pi10_Thirona = pd$Pi10_Thirona_P3 - pd$Pi10_Thirona_P2
+pd$Change_P2_P3_AWT_seg_Thirona = pd$AWT_seg_Thirona_P3 - pd$AWT_seg_Thirona_P2
+pd$Change_P2_P3_WallAreaPct_seg_Thirona = pd$WallAreaPct_seg_Thirona_P3 - pd$WallAreaPct_seg_Thirona_P2
+
+num_vars = c("AWT_seg_Thirona_P2", "distwalked_P2", "FEV1_FVC_post_P2",  
+             "FEV1_post_P2", "FVC_post_P2", "lung_density_vnb_P2", "Resting_SaO2_P2", "finalGold_P2", 
+             "PEF_post_P2", "FRC_TLC_ratio_Thirona_P2", "WallAreaPct_seg_Thirona_P2", "DLco_raw_P2", "FEF2575_post_P2")
+log_vars = c("pctEmph_Thirona_P2", "pctGasTrap_Thirona_P2", "TLC_Thirona_P2", "FRC_Thirona_P2", "Pi10_Thirona_P2")
+negbinom_vars = c("Exacerbation_Frequency_P2", "SGRQ_scoreTotal_P2", "BODE_P2")
+bin_vars = c("copd_P2", "Severe_Exacerbations_P2", "smoking_status_P2", "Chronic_Bronchitis_P2") 
+covars = c("Age_P2", "gender", "race", "scanner_model_clean_P2", "BMI_P2", "smoking_status_P2", "ATS_PackYears_P2", "ccenter_P2", "Height_CM_P2")
+
+bin_vars = bin_vars[bin_vars != "smoking_status_P2"]
+
+#new
+change_vars = c("Change_P2_P3_distwalked", "Change_P2_P3_FEV1_ml", "Change_P2_P3_FEV1_ml_yr", "Change_P2_P3_FEV1pp", 
+             "Change_P2_P3_FRC_TLC_ratio_Thirona", "Change_P2_P3_pctGasTrap_Thirona", "Change_P2_P3_lung_density_vnb", 
+             "Change_P2_P3_Pi10_Thirona", "Change_P2_P3_AWT_seg_Thirona", "Change_P2_P3_WallAreaPct_seg_Thirona")
+
+#specify different covariate adjustments
+
+#NEED TO ADD IN ADDITIONAL
+#fix covar adjs. 
+adjust_null = c("distwalked_P2",  "Resting_SaO2_P2",  "finalGold_P2",
+                "Exacerbation_Frequency_P2", "Chronic_Bronchitis_P2",
+                "Severe_Exacerbations_P2", "copd_P2", "GoldCategory_P2", "SGRQ_scoreTotal_P2", "BODE_P2")
+adjust_spiro = c("FEV1_FVC_post_P2", "FEV1_post_P2", "FVC_post_P2", "PEF_post_P2", "DLco_raw_P2", "FEF2575_post_P2")
+adjust_ct = c("AWT_seg_Thirona_P2", "lung_density_vnb_P2", "pctEmph_Thirona_P2", 
+              "pctGasTrap_Thirona_P2", "TLC_Thirona_P2", "FRC_Thirona_P2", "Pi10_Thirona_P2", "FRC_TLC_ratio_Thirona_P2", "WallAreaPct_seg_Thirona_P2")
+
+#what do about smoking status?
+
+#i should adjust for baseline for change traits. ugh. how do i work that in?
+
+
+#pd = pd %>% dplyr::select(sid, all_of(num_vars), all_of(log_vars), all_of(bin_vars), all_of(negbinom_vars), all_of(covars))
+rownames(pd) = pd$sid
+
+
+```
+
+# ORS Associations in COPDGene Testing Set
+
+```{r}
+df = readRDS(files[1])
+namey = rownames(df)
+for (x in files[2:length(files)]){
+  file = readRDS(x)
+  df = cbind(df, file)
+}
+rownames(df) = namey
+
+#name odd cols
+preds = gsub(".rds", "", files)
+phenos = gsub("predictions", "pheno", preds)
+
+colnames(df) = c(rbind(preds, phenos))
+
+df = merge(df, pd, by = "row.names")
+rownames(df) = df$Row.names
+
+```
+
+```{r eval = F}
+#metabolites
+#quant models
+results = NULL
+for (x in adjust_null[adjust_null %in% c(num_vars, log_vars)]){
+  pheno = paste0("pheno_metabolite_elastic_", x)
+  score = paste0("predictions_metabolite_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)]){
+  pheno = paste0("pheno_metabolite_elastic_", x)
+  score = paste0("predictions_metabolite_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% c(num_vars, log_vars)]){
+  pheno = paste0("pheno_metabolite_elastic_", x)
+  score = paste0("predictions_metabolite_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#neg binom 
+for (x in adjust_null[adjust_null %in% negbinom_vars]){
+  pheno = paste0("pheno_metabolite_elastic_", x)
+  score = paste0("predictions_metabolite_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm.nb(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  null = glm.nb(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% negbinom_vars]){
+  pheno = paste0("pheno_metabolite_elastic_", x)
+  score = paste0("predictions_metabolite_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm.nb(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  null = glm.nb(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% negbinom_vars]){
+  pheno = paste0("pheno_metabolite_elastic_", x)
+  score = paste0("predictions_metabolite_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm.nb(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  null = glm.nb(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#bin
+for (x in adjust_null[adjust_null %in% bin_vars]){
+  #
+  #
+  #x = adjust_null[adjust_null %in% bin_vars][6]
+  #results = NULL
+  #
+  #
+  pheno = paste0("pheno_metabolite_elastic_", x)
+  score = paste0("predictions_metabolite_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  part = NA
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  names(pheno) = rownames(df)
+  pred1 = predict(mod, type = "response")
+  pheno = pheno[names(pheno) %in% names(pred1)]
+  rsq.full = auc(pheno, pred1)[1]
+  pred2 = predict(null, type = "response")
+  rsq.null = auc(pheno, pred2)[1]
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#delong test
+#met copd
+pheno = paste0("pheno_metabolite_elastic_", "copd_P2")
+score = paste0("predictions_metabolite_elastic_", "copd_P2")
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+names(pheno) = rownames(df)
+pred1 = predict(mod, type = "response")
+pheno = pheno[names(pheno) %in% names(pred1)]
+rsq.full = auc(pheno, pred1)
+pred2 = predict(null, type = "response")
+rsq.null = auc(pheno, pred2)
+roc.test(rsq.full, rsq.null)$p.value #3.763699e-05
+
+#prot copd
+pheno = paste0("pheno_protein_elastic_", "copd_P2")
+score = paste0("predictions_protein_elastic_", "copd_P2")
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+names(pheno) = rownames(df)
+pred1 = predict(mod, type = "response")
+pheno = pheno[names(pheno) %in% names(pred1)]
+rsq.full = auc(pheno, pred1)
+pred2 = predict(null, type = "response")
+rsq.null = auc(pheno, pred2)
+roc.test(rsq.full, rsq.null)$p.value #4.421724e-05
+
+#trans copd
+pheno = paste0("pheno_transcript_elastic_", "copd_P2")
+score = paste0("predictions_transcript_elastic_", "copd_P2")
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+names(pheno) = rownames(df)
+pred1 = predict(mod, type = "response")
+pheno = pheno[names(pheno) %in% names(pred1)]
+rsq.full = auc(pheno, pred1)
+pred2 = predict(null, type = "response")
+rsq.null = auc(pheno, pred2)
+roc.test(rsq.full, rsq.null)$p.value #0.001484617
+
+for (x in adjust_spiro[adjust_spiro %in% bin_vars]){
+  pheno = paste0("pheno_metabolite_elastic_", x)
+  score = paste0("predictions_metabolite_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  part = NA
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  names(pheno) = rownames(df)
+  pred1 = predict(mod, type = "response")
+  pheno = pheno[names(pheno) %in% names(pred1)]
+  rsq.full = auc(pheno, pred1)[1]
+  pred2 = predict(null, type = "response")
+  rsq.null = auc(pheno, pred2)[1]
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% bin_vars]){
+  pheno = paste0("pheno_metabolite_elastic_", x)
+  score = paste0("predictions_metabolite_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  part = NA
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  names(pheno) = rownames(df)
+  pred1 = predict(mod, type = "response")
+  pheno = pheno[names(pheno) %in% names(pred1)]
+  rsq.full = auc(pheno, pred1)[1]
+  pred2 = predict(null, type = "response")
+  rsq.null = auc(pheno, pred2)[1]
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#change vars
+x = "Change_P2_P3_distwalked"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + distwalked_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + distwalked_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FEV1_ml"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FEV1_ml_yr"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FEV1pp"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FRC_TLC_ratio_Thirona"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + FRC_TLC_ratio_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + FRC_TLC_ratio_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_pctGasTrap_Thirona"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + pctGasTrap_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + pctGasTrap_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_lung_density_vnb"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + lung_density_vnb_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + lung_density_vnb_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_Pi10_Thirona"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + Pi10_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + Pi10_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_AWT_seg_Thirona"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + AWT_seg_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + AWT_seg_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_WallAreaPct_seg_Thirona"
+pheno = paste0("pheno_metabolite_elastic_", x)
+score = paste0("predictions_metabolite_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + WallAreaPct_seg_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + WallAreaPct_seg_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+colnames(results) = c("p", "beta", "beta.hi", "beta.lo", "rsq.partial", "rsq.full", "rsq.null")
+rownames(results) = c(adjust_null[adjust_null %in% c(num_vars, log_vars)], adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)], adjust_ct[adjust_ct %in% c(num_vars, log_vars)], adjust_null[adjust_null %in% c(negbinom_vars)], adjust_spiro[adjust_spiro %in% c(negbinom_vars)], adjust_ct[adjust_ct %in% c(negbinom_vars)], adjust_null[adjust_null %in% c(bin_vars)], adjust_spiro[adjust_spiro %in% c(bin_vars)], adjust_ct[adjust_ct %in% c(bin_vars)], change_vars)
+met = as.data.frame(results)
+
+
+#
+##
+
+#PROTEINS (no categories)
+
+#quant models
+results = NULL
+for (x in adjust_null[adjust_null %in% c(num_vars, log_vars)]){
+  pheno = paste0("pheno_protein_elastic_", x)
+  score = paste0("predictions_protein_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)]){
+  pheno = paste0("pheno_protein_elastic_", x)
+  score = paste0("predictions_protein_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% c(num_vars, log_vars)]){
+  pheno = paste0("pheno_protein_elastic_", x)
+  score = paste0("predictions_protein_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#neg binom 
+for (x in adjust_null[adjust_null %in% negbinom_vars]){
+  pheno = paste0("pheno_protein_elastic_", x)
+  score = paste0("predictions_protein_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm.nb(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  null = glm.nb(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% negbinom_vars]){
+  pheno = paste0("pheno_protein_elastic_", x)
+  score = paste0("predictions_protein_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm.nb(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  null = glm.nb(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% negbinom_vars]){
+  pheno = paste0("pheno_protein_elastic_", x)
+  score = paste0("predictions_protein_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm.nb(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  null = glm.nb(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#bin
+for (x in adjust_null[adjust_null %in% bin_vars]){
+  pheno = paste0("pheno_protein_elastic_", x)
+  score = paste0("predictions_protein_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  part = NA
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  names(pheno) = rownames(df)
+  pred1 = predict(mod, type = "response")
+  pheno = pheno[names(pheno) %in% names(pred1)]
+  rsq.full = auc(pheno, pred1)[1]
+  pred2 = predict(null, type = "response")
+  rsq.null = auc(pheno, pred2)[1]
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% bin_vars]){
+  pheno = paste0("pheno_protein_elastic_", x)
+  score = paste0("predictions_protein_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  part = NA
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  names(pheno) = rownames(df)
+  pred1 = predict(mod, type = "response")
+  pheno = pheno[names(pheno) %in% names(pred1)]
+  rsq.full = auc(pheno, pred1)[1]
+  pred2 = predict(null, type = "response")
+  rsq.null = auc(pheno, pred2)[1]
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% bin_vars]){
+  pheno = paste0("pheno_protein_elastic_", x)
+  score = paste0("predictions_protein_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  part = NA
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  names(pheno) = rownames(df)
+  pred1 = predict(mod, type = "response")
+  pheno = pheno[names(pheno) %in% names(pred1)]
+  rsq.full = auc(pheno, pred1)[1]
+  pred2 = predict(null, type = "response")
+  rsq.null = auc(pheno, pred2)[1]
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#change vars
+x = "Change_P2_P3_distwalked"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + distwalked_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + distwalked_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FEV1_ml"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FEV1_ml_yr"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FEV1pp"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FRC_TLC_ratio_Thirona"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + FRC_TLC_ratio_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + FRC_TLC_ratio_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_pctGasTrap_Thirona"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + pctGasTrap_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + pctGasTrap_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_lung_density_vnb"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + lung_density_vnb_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + lung_density_vnb_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_Pi10_Thirona"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + Pi10_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + Pi10_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_AWT_seg_Thirona"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + AWT_seg_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + AWT_seg_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_WallAreaPct_seg_Thirona"
+pheno = paste0("pheno_protein_elastic_", x)
+score = paste0("predictions_protein_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + WallAreaPct_seg_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + WallAreaPct_seg_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+colnames(results) = c("p", "beta", "beta.hi", "beta.lo", "rsq.partial", "rsq.full", "rsq.null")
+rownames(results) = c(adjust_null[adjust_null %in% c(num_vars, log_vars)], adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)], adjust_ct[adjust_ct %in% c(num_vars, log_vars)], adjust_null[adjust_null %in% c(negbinom_vars)], adjust_spiro[adjust_spiro %in% c(negbinom_vars)], adjust_ct[adjust_ct %in% c(negbinom_vars)], adjust_null[adjust_null %in% c(bin_vars)], adjust_spiro[adjust_spiro %in% c(bin_vars)], adjust_ct[adjust_ct %in% c(bin_vars)], change_vars)
+prot = as.data.frame(results)
+
+#TRANSCRIPTS (no categories)
+
+#quant models
+results = NULL
+for (x in adjust_null[adjust_null %in% c(num_vars, log_vars)]){
+  pheno = paste0("pheno_transcript_elastic_", x)
+  score = paste0("predictions_transcript_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)]){
+  pheno = paste0("pheno_transcript_elastic_", x)
+  score = paste0("predictions_transcript_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% c(num_vars, log_vars)]){
+  pheno = paste0("pheno_transcript_elastic_", x)
+  score = paste0("predictions_transcript_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#neg binom 
+for (x in adjust_null[adjust_null %in% negbinom_vars]){
+  pheno = paste0("pheno_transcript_elastic_", x)
+  score = paste0("predictions_transcript_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm.nb(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  null = glm.nb(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% negbinom_vars]){
+  pheno = paste0("pheno_transcript_elastic_", x)
+  score = paste0("predictions_transcript_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm.nb(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  null = glm.nb(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% negbinom_vars]){
+  pheno = paste0("pheno_transcript_elastic_", x)
+  score = paste0("predictions_transcript_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm.nb(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  null = glm.nb(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2, df)
+  part = rsq.partial(mod, null, adj = T)$partial.rsq
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  rsq.full = summary(mod)$adj.r.squared
+  rsq.null = summary(null)$adj.r.squared
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#bin
+for (x in adjust_null[adjust_null %in% bin_vars]){
+  pheno = paste0("pheno_transcript_elastic_", x)
+  score = paste0("predictions_transcript_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  part = NA
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  names(pheno) = rownames(df)
+  pred1 = predict(mod, type = "response")
+  pheno = pheno[names(pheno) %in% names(pred1)]
+  rsq.full = auc(pheno, pred1)[1]
+  pred2 = predict(null, type = "response")
+  rsq.null = auc(pheno, pred2)[1]
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_spiro[adjust_spiro %in% bin_vars]){
+  pheno = paste0("pheno_transcript_elastic_", x)
+  score = paste0("predictions_transcript_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  part = NA
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  names(pheno) = rownames(df)
+  pred1 = predict(mod, type = "response")
+  pheno = pheno[names(pheno) %in% names(pred1)]
+  rsq.full = auc(pheno, pred1)[1]
+  pred2 = predict(null, type = "response")
+  rsq.null = auc(pheno, pred2)[1]
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+for (x in adjust_ct[adjust_ct %in% bin_vars]){
+  pheno = paste0("pheno_transcript_elastic_", x)
+  score = paste0("predictions_transcript_elastic_", x)
+  pheno = df[, colnames(df) == pheno]
+  score = df[, colnames(df) == score]  
+  mod = glm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  null = glm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2, df, family = "binomial")
+  part = NA
+  terms = get_model_data(mod, type = "std")
+  p = summary(mod)$coefficients["score", "Pr(>|z|)"]
+  beta = terms$estimate[1]
+  beta.hi = terms$conf.low[1]
+  beta.lo = terms$conf.high[1]
+  names(pheno) = rownames(df)
+  pred1 = predict(mod, type = "response")
+  pheno = pheno[names(pheno) %in% names(pred1)]
+  rsq.full = auc(pheno, pred1)[1]
+  pred2 = predict(null, type = "response")
+  rsq.null = auc(pheno, pred2)[1]
+  results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+}
+
+#change vars
+x = "Change_P2_P3_distwalked"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + distwalked_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + distwalked_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FEV1_ml"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FEV1_ml_yr"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FEV1pp"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + Height_CM_P2 + FEV1_post_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_FRC_TLC_ratio_Thirona"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + FRC_TLC_ratio_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + FRC_TLC_ratio_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_pctGasTrap_Thirona"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + pctGasTrap_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + pctGasTrap_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_lung_density_vnb"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + lung_density_vnb_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + lung_density_vnb_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_Pi10_Thirona"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + Pi10_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + Pi10_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_AWT_seg_Thirona"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + AWT_seg_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + AWT_seg_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+x = "Change_P2_P3_WallAreaPct_seg_Thirona"
+pheno = paste0("pheno_transcript_elastic_", x)
+score = paste0("predictions_transcript_elastic_", x)
+pheno = df[, colnames(df) == pheno]
+score = df[, colnames(df) == score]  
+mod = lm(pheno ~ score + Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + WallAreaPct_seg_Thirona_P2, df) 
+null = lm(pheno ~ Age_P2 + gender + race + smoking_status_P2 + ATS_PackYears_P2 + ccenter_P2 + scanner_model_clean_P2 + WallAreaPct_seg_Thirona_P2, df)
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+terms = get_model_data(mod, type = "std")
+p = summary(mod)$coefficients["score", "Pr(>|t|)"]
+beta = terms$estimate[1]
+beta.hi = terms$conf.low[1]
+beta.lo = terms$conf.high[1]
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+results = rbind(results, c(p, beta, beta.hi, beta.lo, part, rsq.full, rsq.null))
+
+colnames(results) = c("p", "beta", "beta.hi", "beta.lo", "rsq.partial", "rsq.full", "rsq.null")
+rownames(results) = c(adjust_null[adjust_null %in% c(num_vars, log_vars)], adjust_spiro[adjust_spiro %in% c(num_vars, log_vars)], adjust_ct[adjust_ct %in% c(num_vars, log_vars)], adjust_null[adjust_null %in% c(negbinom_vars)], adjust_spiro[adjust_spiro %in% c(negbinom_vars)], adjust_ct[adjust_ct %in% c(negbinom_vars)], adjust_null[adjust_null %in% c(bin_vars)], adjust_spiro[adjust_spiro %in% c(bin_vars)], adjust_ct[adjust_ct %in% c(bin_vars)], change_vars)
+trans = as.data.frame(results)
+
+
+```
+
+## Combining Models for Plotting
+
+```{r eval = F}
+met$type = "Metabolite"
+prot$type = "Protein"
+trans$type = "Transcript"
+
+met$pheno = rownames(met)
+prot$pheno = rownames(prot)
+trans$pheno = rownames(trans)
+
+full = rbind(met, prot, trans)
+
+#full$bh = p.adjust(full$p, method = "bonferroni")
+full$bh = p.adjust(full$p, method = "BH")
+
+full$sig = F
+full[full$bh <= .05, ]$sig = T
+
+full$class = NA
+full[full$pheno %in% bin_vars, ]$class = "binomial"
+full[full$pheno %in% negbinom_vars, ]$class = "negbinomial"
+full[full$pheno %in% log_vars, ]$class = "log"
+full[full$pheno %in% num_vars, ]$class = "gaussian"
+
+write.csv(full, "C:/Users/konigsbi/Desktop/ors_topmed/January/Results/COPDGene_testing_results.csv")
+```
+
+```{r}
+full = read.csv("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/COPDGene_testing_results.csv", row.names = 1)
+
+full$pheno = gsub("_P2", "", full$pheno)
+full$pheno = gsub("_P3", "", full$pheno)
+full$pheno = gsub("distwalked", "6MWD", full$pheno)
+full$pheno = gsub("Resting_SaO2", "SaO2", full$pheno)
+full$pheno = gsub("finalGold", "GOLD Stage", full$pheno)
+full$pheno = gsub("FEV1_FVC_post", "FEV1/FVC", full$pheno)
+full$pheno = gsub("FEV1_post", "FEV1", full$pheno)
+full$pheno = gsub("FVC_post", "FVC", full$pheno)
+full$pheno = gsub("AWT_seg_Thirona", "Airway Wall Thickness", full$pheno)
+full$pheno = gsub("lung_density_vnb", "Lung Density", full$pheno)
+full$pheno = gsub("pctGasTrap_Thirona", "Gas Trapping", full$pheno)
+full$pheno = gsub("pctEmph_Thirona", "Emphysema", full$pheno)
+full$pheno = gsub("Exacerbation_Frequency", "Exacerbation Frequency", full$pheno)
+full$pheno = gsub("Chronic_Bronchitis", "Chronic Bronchitis", full$pheno)
+full$pheno = gsub("copd", "COPD", full$pheno)
+full$pheno = gsub("Severe_Exacerbations", "Exacerbations (y/n)", full$pheno)
+full$pheno = gsub("Change_6MW Distance", "6MWD Change", full$pheno)
+full$pheno = gsub("Change_FEV1_ml_yr", "FEV1 Change (ml/yr)", full$pheno)
+full$pheno = gsub("Change_FEV1_ml", "FEV1 Change (ml)", full$pheno)
+full$pheno = gsub("Change_FEV1pp", "FEV1 Change (% predicted)", full$pheno)
+
+#new
+full$pheno = gsub("DLco_raw", "DLco", full$pheno)
+full$pheno = gsub("FEF2575_post", "FEF25-75", full$pheno)
+full$pheno = gsub("TLC_Thirona", "TLC", full$pheno)
+full$pheno = gsub("FRC_Thirona", "FRC", full$pheno)
+full$pheno = gsub("FRC_TLC_ratio_Thirona", "FRC/TLC", full$pheno)
+full$pheno = gsub("WallAreaPct_seg_Thirona", "Wall Area Percent", full$pheno)
+full$pheno = gsub("SGRQ_scoreTotal", "SGRQ", full$pheno)
+full$pheno = gsub("PEF_post", "PEF", full$pheno)
+full$pheno = gsub("Pi10_Thirona", "Pi10", full$pheno)
+
+#full$pheno = gsub("", "", full$pheno)
+
+
+
+full_change = full[grep("Change", rownames(full)), ]
+full = full[-grep("P3", rownames(full)), ]
+
+#volcano plot. no negative betas, doesnt look like vlocano. 
+#groups by model type, so should subset. or facet. 
+full$class2 = full$class
+#full[full$class2 == "log" | full$class2 == "gaussian", ]$class2 = "Continuous"
+#full[full$class2 == "negbinomial" | full$class2 == "binomial", ]$class2 = "Non-Continuous"
+
+#new
+full[full$class2 == "log" | full$class2 == "gaussian", ]$class2 = "Gaussian"
+full[full$class2 == "negbinomial", ]$class2 = "Negative Binomial"
+full[full$class2 == "binomial", ]$class2 = "Binomial"
+full$class2 = factor(full$class2, levels = c("Gaussian", "Negative Binomial", "Binomial"))
+
+write.csv(full, "C:/Users/konigsbi/Desktop/ors_topmed/manuscript/Supplement/Full_COPDGene_forSupp.csv")
+
+a_one = ggplot(full, aes(beta, -log10(bh), color = type)) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.4) +
+  geom_point() +
+  geom_label_repel(aes(label = pheno, fill = type), alpha = 0.7, size = 4, box.padding = 0.1, seed = 11, color = "black", force = 8) +
+  facet_wrap(~class2, scales = "free") +
+  labs(x = "Effect Size", y = "-log10(adjusted p-value)", color = "") +
+  theme(legend.position = "bottom", strip.background = element_blank(), strip.text.x = element_text(size = 12)) +
+  guides(fill = "none")
+a_one
+#ggsave("C:/Users/konigsbi/Desktop/ors_topmed/April/Figures/COPDGene_scorevolcs_multi.png", units = "in", height = 6, width = 12)
+
+#plot rsqs
+a_two = ggplot(full[full$class == "gaussian" | full$class == "log", ]) + 
+  geom_bar(aes(rsq.full, pheno, fill = type, alpha = sig), stat = "identity", position = "dodge") + 
+  geom_bar(aes(rsq.null, pheno), stat = "identity", position = "dodge") + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+  labs(x = bquote("Adjusted R"^2), y = "", fill = "") +
+  scale_y_discrete(limits = rev(levels(factor(full[full$class == "gaussian" | full$class == "log", ]$pheno)))) + 
+  scale_alpha_manual(values = c(1)) +
+  guides(alpha = "none") +
+  coord_cartesian(xlim=c(0, 0.7))
+a_two
+
+#plot aucs
+b_two = ggplot(full[full$class == "binomial", ]) + 
+  geom_bar(aes(rsq.full, pheno, fill = type, alpha = sig), stat = "identity", position = "dodge") + 
+  geom_bar(aes(rsq.null, pheno), stat = "identity", position = "dodge") + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+  labs(x = "AUROC", y = "", fill = "") +
+  scale_y_discrete(limits = rev(levels(factor(full[full$class == "binomial", ]$pheno)))) + 
+  scale_alpha_manual(values = c(0.3, 1)) +
+  guides(fill = "none") +
+  coord_cartesian(xlim=c(0.5, 0.9))
+b_two
+
+
+```
+
+# Supplementary Figure 2
+```{r}
+modfiles = dir("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/models_copdgene/")
+modfiles = modfiles[-grep("std", modfiles)]
+modfiles = modfiles[-grep("Categor", modfiles)]
+modfiles = modfiles[-grep("pp", modfiles)]
+modfiles = modfiles[-grep("Change", modfiles)]
+modfiles = modfiles[-grep("Age", modfiles)]
+modfiles = modfiles[-grep("MMRC", modfiles)]
+modfiles = paste0("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/models_copdgene/", modfiles)
+
+#make sure model_select cant select zero feature models.............................. what do zero feature models even mean. 
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  alpha_orig = df[df$measure == min(df$measure), ]$alpha
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic, alpha_orig))
+}
+
+
+#need model_select
+df = NULL
+for (x in modfiles){
+  print(x)
+  dat = readRDS(x)
+  test = model_select(dat)
+  dat = dat$modlist[[test[1]]] 
+  coefs = as.data.frame(as.matrix(coef(dat, s = test[2]))) 
+  coefs = coefs[coefs$s1 != 0, ]
+  type = stringr::str_split(x, "_", simplify = T)[4]
+  pheno = stringr::str_split(x, "_", simplify = T)[5] 
+  df = as.data.frame(rbind(df, c(pheno, length(coefs) - 1, type, test[3], test[4])))
+}
+df
+
+#uh oh, my mod select may select 0 feature models.... why havent i propagated mmrc?
+#should be using mmrc models. 
+#oh well,plotting regardless
+df$V2 = as.numeric(df$V2)
+df$V4 = as.numeric(df$V4)
+df$V5 = as.numeric(df$V5)
+
+df = df[df$V1 != "smoking", ]
+df = df[df$V1 != "ATS", ]
+df = df[df$V1 != "BMI", ]
+df = df[df$V1 != "ATS", ]
+df = df[df$V1 != "FEV6", ]
+
+#stats for paper
+table(df$V4)
+table(df$V5)
+median(df$V2) #also ran the above with with get_model_best to get median for best models. 144.5 total. 675. 
+median(df[df$V3 == "metabolite", ]$V2) # 177. 534
+median(df[df$V3 == "protein", ]$V2) # 135.5. 653.4
+median(df[df$V3 == "transcript", ]$V2) #82. 2793.5
+
+#FEATURE NUMBER
+#great. zoomed in so i dont have to worry about that outlier. 
+e = ggplot(df, aes(V3, V2, fill = V3)) +
+  geom_boxplot() +
+  geom_beeswarm() + 
+  coord_cartesian(ylim = c(0, 450)) +
+  labs(x = "", y = "Feature Count", title = "# of Features per Score") +
+  theme(legend.position = "none")
+
+#ALPHA (1SE)
+#now plot alpha selection. also include for like optimal, not 1se. 
+#so this is fuck ugly...... how do i make this less fuck ugly....
+#should prolly add ticks by alphas tested....
+d = ggplot(df, aes(V3, V4, fill = V3)) +
+  geom_boxplot() + 
+  geom_beeswarm() +
+  theme(legend.position = "none") +
+  labs(x = "", y = expression(alpha), title = paste0(expression(alpha), " of 1se(MSE) models"))
+
+#ALPHA(BEST)
+c = ggplot(df, aes(V3, V5, fill = V3)) +
+  geom_boxplot() + 
+  geom_beeswarm() +
+  theme(legend.position = "none") +
+  labs(x = "", y = expression(alpha), title = paste0(expression(alpha), " of min(MSE) models"))
+
+#one = cowplot::plot_grid(a_one, b, nrow = 2, labels = c("a.", "b."), rel_heights = c(1.1, 1))
+two = cowplot::plot_grid(c, d, e, nrow = 1, labels = c("a. ", "b. ", "c. "))
+
+#supp fig
+png("C:/Users/konigsbi/Desktop/ors_topmed/April/Figures/SuppFigure2.png", units = "in", res = 500, height = 4.5, width = 9)
+cowplot::plot_grid(two, nrow = 1)
+dev.off()
+
+```
+
+# Figure 1
+```{r}
+#figure 1
+second = cowplot::plot_grid(a_two, b_two, nrow = 1, labels = c("b. ", ""))
+
+png("C:/Users/konigsbi/Desktop/ors_topmed/April/Figures/Figure1.png", units = "in", res = 500, height = 13, width = 13)
+cowplot::plot_grid(a_one, second, nrow = 2, rel_heights = c(1, .9), labels = c("a. ", ""))
+dev.off()
+
+#legend on bottom
+
+```
+
+```{r}
+Sys.time()
+
+Sys.time() - start #1 minute
+```
+
+
+
+################
+
+cva fev1 fig
+```{r eval=T}
+
+#example alpha/lambda selection. find optimal vals for vertical lines. figure out putting vertical lines on plot. 
+#select fev1 protein
+mod = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/models_copdgene/model_protein_FEV1_post_P2.rds")
+index = 1
+df = NULL
+for (x in 1:11){
+  alpha = mod$alpha[x]
+  moddy = mod$modlist[[x]]
+  for (y in 1:length(moddy$lambda)){
+    lambda = moddy$lambda[y]
+    nonzero = moddy$nzero[y]
+    measure = moddy$cvm[y]
+    se = moddy$cvsd[y]
+    df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+  }
+  index = index + 1
+}
+df = as.data.frame(df)
+names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+df = df[df$nonzero != 0, ]
+min_measure = df[df$measure == min(df$measure), ]$measure
+se_measure = df[df$measure == min(df$measure), ]$se
+sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+
+sub_df = sub_df[order(sub_df$measure), ]
+miny = sub_df$lambda[1]
+sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+sub_df = sub_df[order(sub_df$lambda, decreasing = T), ]
+maxy = sub_df$lambda[1]
+
+
+png("C:/Users/konigsbi/Desktop/ors_topmed/April/Figures/SuppFigure3.png", units = "in", width = 8, height = 6, res = 500)
+x = mod
+log.x = T
+ n <- length(x$modlist)
+    cvm <- sapply(x$modlist, "[[", "cvm", simplify=FALSE)
+    oldPal <- palette(topo.colors(n))
+    on.exit(palette(oldPal))
+    ylab <- x$modlist[[1]]$name
+    xlst <- lapply(x$modlist, "[[", "lambda")
+    ylst <- lapply(x$modlist, "[[", "cvm")
+    xlim <- if(log.x) log(range(xlst)) else range(xlst)
+    ylim <- range(ylst)
+    xlab <- if(log.x) "log Lambda" else "Lambda"
+    plot(NA, xlim=xlim, ylim=ylim, xlab=xlab, ylab=x$modlist[[1]]$name, type="n")
+    for(i in seq_along(cvm))
+    {
+        xvals <- if(log.x) log(xlst[[i]]) else xlst[[i]]
+        lines(xvals, ylst[[i]], col=i)
+    }
+    abline(v = c(log(maxy), log(miny)), col = c("grey30", "red3"), lty = c(2, 2))
+
+      graphics::legend(xlim[1], ylim[2], x$alpha, col=seq_along(x$alpha), lty=1)
+
+dev.off()
+      
+      
+
+
+
+```
+
+
+# Supp Table X: # features & alpha selection
+
+```{r}
+modfiles = dir("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/models_copdgene/")
+modfiles = modfiles[-grep("std", modfiles)]
+modfiles = modfiles[-grep("Categor", modfiles)]
+modfiles = modfiles[-grep("pp", modfiles)]
+modfiles = modfiles[-grep("Change", modfiles)]
+modfiles = modfiles[-grep("Age", modfiles)]
+modfiles = modfiles[-grep("MMRC", modfiles)]
+modfiles = paste0("C:/Users/konigsbi/Desktop/ors_topmed/January/Results/models_copdgene/", modfiles)
+
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  alpha_orig = df[df$measure == min(df$measure), ]$alpha
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic, alpha_orig))
+}
+
+model_select_best = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  alpha_orig = df[df$measure == min(df$measure), ]$alpha
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  alpha_elastic = df[df$measure == min(df$measure), ]$alpha
+  lambda_elastic = df[df$measure == min(df$measure), ]$lambda
+  nonzero_elastic = df[df$measure == min(df$measure), ]$nonzero
+  alpha_index = df[df$lambda == max(df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic, alpha_orig))
+}
+
+
+#need model_select
+df1 = NULL
+for (x in modfiles){
+  print(x)
+  dat = readRDS(x)
+  test = model_select(dat)
+  dat = dat$modlist[[test[1]]] 
+  coefs = as.data.frame(as.matrix(coef(dat, s = test[2]))) 
+  coefs = coefs[coefs$s1 != 0, ]
+  type = stringr::str_split(x, "_", simplify = T)[4]
+  pheno = stringr::str_split(x, "_", simplify = T)[5] 
+  df1 = as.data.frame(rbind(df1, c(pheno, length(coefs) - 1, type, test[3], test[4])))
+}
+
+df2 = NULL
+for (x in modfiles){
+  print(x)
+  dat = readRDS(x)
+  test = model_select_best(dat)
+  dat = dat$modlist[[test[1]]] 
+  coefs = as.data.frame(as.matrix(coef(dat, s = test[2]))) 
+  coefs = coefs[coefs$s1 != 0, ]
+  type = stringr::str_split(x, "_", simplify = T)[4]
+  pheno = stringr::str_split(x, "_", simplify = T)[5] 
+  df2 = as.data.frame(rbind(df2, c(pheno, length(coefs) - 1, type, test[3], test[4])))
+}
+
+df1$type = "1se"
+df2$type = "best"
+
+df = as.data.frame(rbind(df1, df2))
+
+#uh oh, my mod select may select 0 feature models.... why havent i propagated mmrc?
+#should be using mmrc models. 
+#oh well,plotting regardless
+df$V2 = as.numeric(df$V2)
+df$V4 = as.numeric(df$V4)
+df$V5 = as.numeric(df$V5)
+
+df = df[df$V1 != "smoking", ]
+df = df[df$V1 != "ATS", ]
+df = df[df$V1 != "BMI", ]
+df = df[df$V1 != "ATS", ]
+df = df[df$V1 != "FEV6", ]
+
+#stats for paper
+#table(df$V4)
+#table(df$V5)
+#median(df$V2) #also ran the above with with get_model_best to get median for best models. 144.5 total. 675. 
+#median(df[df$V3 == "metabolite", ]$V2) # 177. 534
+#median(df[df$V3 == "protein", ]$V2) # 135.5. 653.4
+#median(df[df$V3 == "transcript", ]$V2) #82. 2793.5
+
+
+
+write.csv(df, "C:/Users/konigsbi/Desktop/ors_topmed/manuscript/Supplement/ST_modelparams.csv")
+
+
+
+
+```
+
+looking at how betas vary by type. 
+```{r eval=F}
+#have full generated from above. 
+#need to cut down on things. 
+
+ggplot(full, aes(type, beta)) +
+  geom_boxplot()
+  geom_beeswarm() #not impressive. 
+
+summary(aov(beta ~ type, full)) #0.62
+  
+sub = full[full$class == "gaussian" | full$class == "log", ] 
+  
+ggplot(sub, aes(type, beta)) +
+  geom_boxplot()
+  geom_beeswarm() 
+
+summary(aov(beta ~ type, sub)) #4.64e-05 ***
+
+t.test(beta ~ type, sub[sub$type != "Metabolite", ]) #2.214e-05. so prot and trans dif. 
+t.test(beta ~ type, sub[sub$type != "Transcript", ]) #0.02694 
+t.test(beta ~ type, sub[sub$type != "Protein", ]) #0.01216
+
+
+#p
+ggplot(sub, aes(type, -log10(p))) +
+  geom_boxplot()
+  geom_beeswarm() 
+
+
+summary(aov(-log10(p) ~ type, sub)) #0.000239 ***
+
+t.test(-log10(p) ~ type, sub[sub$type != "Metabolite", ]) #9.564e-05
+t.test(-log10(p) ~ type, sub[sub$type != "Transcript", ]) #0.2732
+t.test(-log10(p) ~ type, sub[sub$type != "Protein", ]) #0.002286
+
+
+```
+
+# Wrap-Up
+
+```{r}
+Sys.time() - start
+
+sessionInfo()
+
+```
