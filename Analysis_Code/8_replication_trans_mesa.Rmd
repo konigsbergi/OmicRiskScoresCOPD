@@ -1,0 +1,337 @@
+---
+title: "Transcriptomic Risk Score Replication in MESA"
+author: "Iain Konigsberg"
+date: '`r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/konigsbi/Desktop/ors_topmed/")
+```
+
+
+```{r}
+library(ggplot2)
+library(glmnetUtils)
+library(data.table)
+library(readxl)
+library(stringr)
+library(sjPlot)
+
+setwd("C:/Users/konigsbi/Desktop/ors_topmed/")
+
+theme_set(theme_bw())
+set.seed(11)
+
+replicate = function(omics, model, lambda = "lambda.min"){
+  weights = as.data.frame(as.matrix(coef(model, s = lambda)))
+  weights$dummy = NA
+  weights = weights[weights$s1 != 0, ]
+  rownames(weights) = str_split(rownames(weights), "\\.", simplify = T)[,1] #specific to transcriptomics
+  print(paste0("Number of Non-Zero model weights: ", nrow(weights) - 1))
+  print(paste0("Number of Non-Zero model weights in replication sample: ", nrow(weights[rownames(weights) %in% colnames(omics), ])))
+  
+  inty = weights$s1[1]
+  weights = weights[2:nrow(weights), ]
+  
+  weights = weights[rownames(weights) %in% colnames(omics), ]
+  omics_sub = omics[, colnames(omics) %in% rownames(weights)]
+  
+  weights = weights[order(rownames(weights)), ]
+  omics_sub = omics_sub[, order(colnames(omics_sub))]
+  
+  print(paste0("Model Weights & Omics Line Up: ", all(rownames(weights) == colnames(omics_sub))))
+  omics_sub = t(omics_sub)
+  
+  scores = as.data.frame(t(weights$s1 %*% as.matrix(omics_sub) + inty)) 
+  names(scores) = "score"
+  return(scores)
+}
+
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic))
+}
+
+
+```
+
+
+```{r}
+pd = fread("Data/MESA/SHARe Phenotype Datasets/MESAExam1_5/SHARe_Exam1Main.txt") #6431
+pd = as.data.frame(pd) %>% dplyr::select(sidno, age1c, race1c, gender1, site1c, bmi1c, pkyrs1c, cig1c, htcm1)
+pd2 = fread("Data/MESA/SHARe Phenotype Datasets/MESAExam1_5/SHARe_Exam5Main.txt")
+pd2 = as.data.frame(pd2) %>% dplyr::select(sidno, age5c, site5c, bmi5c, pkyrs5c, cig5c, htcm5)
+pd = merge(pd, pd2, by = "sidno", all = T)
+#should take note of exclusions
+spiro = as.data.frame(fread("Data/MESA/SHARe Phenotype Datasets/Lung/SHARe_AncilMesaLungSpirometryExam5.txt")) 
+spiro = spiro %>% dplyr::select(sidno, fev1ab5, fvcab5, fevfvcab5, cpgoldab5, cpstgab5, f2575ab5, pefab5)
+pd = merge(pd, spiro, by = "sidno", all = T)
+ct = as.data.frame(fread("Data/MESA/SHARe Phenotype Datasets/Lung/SHARe_AncilMesaLungExam1CT.txt")) #6425. 3853 w/ exam1 scans.  
+ct = ct %>% dplyr::select(sidno, B_tot_vx, B_be_950, model) 
+ct$pctemph = ct$B_be_950/ct$B_tot_vx #needs to be log transformed for analysis. 
+pd = merge(pd, ct, by = "sidno", all = T)
+airway = as.data.frame(fread("Data/MESA/SHARe Phenotype Datasets/Lung/SHARe_AncilMesaLungAirway.txt"))
+airway = airway %>% dplyr::select(sidno, wall_thickness, wa_pct)
+pd = merge(pd, airway, by = "sidno", all = T)
+
+#handling trans
+tpm = as.data.frame(fread("Data/MESA/Transcriptomics/TOPMed_MESA_RNAseq_Pilot_RSEMv1.3.0.rsem_genes_tpm.txt"))
+rownames(tpm) = tpm$gene_id
+tpm$gene_id = NULL
+tpm$`transcript_id(s)` = NULL
+
+rownames(tpm) = make.unique(str_split(rownames(tpm), "\\.", simplify = T)[,1]) 
+
+namey = as.data.frame(readxl::read_excel("Data/MESA/MESA_TOPMed_WideID_20190517.xlsx", skip = 2)) 
+
+namey$torid_one = NA
+namey$seqcenter_one = NA
+for (x in 1:nrow(namey)){
+  if (!is.na(namey$tor_id11[x])){
+    namey$torid_one[x] = namey$tor_id11[x]
+    namey$seqcenter_one[x] = namey$tor_broaduw11[x]
+  }
+  if (!is.na(namey$tor_id21[x])){
+    namey$torid_one[x] = namey$tor_id21[x]
+    namey$seqcenter_one[x] = namey$tor_broaduw21[x]
+  }
+  if (!is.na(namey$tor_id31[x])){
+    namey$torid_one[x] = namey$tor_id31[x]
+    namey$seqcenter_one[x] = namey$tor_broaduw31[x]
+  }
+}
+
+#get rid of non-pbmc samps. 
+namey[!is.na(namey$tor_specimen15) & namey$tor_specimen15 == "Mono", ]$tor_id15 = NA
+namey[!is.na(namey$tor_specimen25) & namey$tor_specimen25 == "Mono", ]$tor_id25 = NA
+namey[!is.na(namey$tor_specimen25) & namey$tor_specimen25 == "Tcell", ]$tor_id25 = NA
+
+namey$torid_five = NA
+for (x in 1:nrow(namey)){
+  if (!is.na(namey$tor_id15[x])){
+    namey$torid_five[x] = namey$tor_id15[x]
+  }
+  if (!is.na(namey$tor_id25[x])){
+    namey$torid_five[x] = namey$tor_id25[x]
+  }
+}
+
+
+namey = namey %>% dplyr::select(sidno, torid_one, seqcenter_one, torid_five)
+
+namey[namey$sidno == 12786, ]$torid_one = "TOR979709" #manual replace from reading in weirdness
+
+tpm_one = tpm[colnames(tpm) %in% namey$torid_one] 
+tpm_five = tpm[colnames(tpm) %in% namey$torid_five] 
+
+namey_one = namey[!is.na(namey$torid_one), ]
+namey_five = namey[!is.na(namey$torid_five), ]
+
+for (x in 1:ncol(tpm_one)){
+  colnames(tpm_one)[x] = namey_one[namey_one$torid_one == colnames(tpm_one)[x], ]$sidno
+}
+
+for (x in 1:ncol(tpm_five)){
+  colnames(tpm_five)[x] = namey_five[namey_five$torid_five == colnames(tpm_five)[x], ]$sidno
+}
+
+tpm_one = t(tpm_one)
+tpm_five = t(tpm_five)
+
+
+tpm_one = log(tpm_one + 1)
+tpm_five = log(tpm_five + 1)
+
+mod = readRDS("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/model_transcript_FEV1_post_P2.rds")
+weights = coef(mod$modlist[[1]])
+rownames(weights) = str_split(rownames(weights), "\\.", simplify = T)[,1]
+
+tpm_one = tpm_one[, colnames(tpm_one) %in% rownames(weights)] #58311 --> 18915
+
+#apply resid
+namey_one = namey_one[namey_one$sidno %in% rownames(tpm_one), ]
+rownames(namey_one) = namey_one$sidno
+namey_one = namey_one[order(namey_one$sidno), ]
+tpm_one = tpm_one[order(rownames(tpm_one)), ]
+all(rownames(namey_one) == rownames(tpm_one))
+
+tpm_one = apply(tpm_one, 2, function(x){
+  resid(lm(x ~ namey_one$seqcenter_one))
+}) 
+
+```
+
+exam1
+```{r}
+#emphysema
+file = "March/Results/models_copdgene/model_transcript_pctEmph_Thirona_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(tpm_one, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test$pctemph = log(test$pctemph)
+  test = test[test$pctemph != Inf, ]
+  test = test[test$pctemph != -Inf, ]
+  test2 = lm(test$pctemph ~ test$score + test$age1c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig1c) + test$pkyrs1c + test$bmi1c + test$model)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"] 
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("March/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("March/Results/predictions_mesa/", file, "_prediction_Exam1omics.rds"))  
+  
+```
+
+exam5
+```{r}
+#FEV1_P2  
+file = "March/Results/models_copdgene/model_transcript_FEV1_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(tpm_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$fev1ab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"] 
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("March/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("March/Results/predictions_mesa/", file, "_predictions_Exam5omics.rds"))  
+  
+#Fvc_P2  
+file = "March/Results/models_copdgene/model_transcript_FVC_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(tpm_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$fvcab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"] 
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("March/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("March/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+  
+  
+  
+#Fev/fvc_P2  
+file = "March/Results/models_copdgene/model_transcript_FEV1_FVC_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(tpm_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$fevfvcab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"]
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("March/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("March/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+  
+#finalgold_p2
+file = "March/Results/models_copdgene/model_transcript_finalGold_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(tpm_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$cpstgab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c)
+  summary(test2)$coefficients["test$score", "Pr(>|t|)"] 
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("March/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("March/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+  
+#copd_p2
+  file = "March/Results/models_copdgene/model_transcript_copd_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(tpm_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = glm(as.factor(test$cpgoldab5) ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c, family = "binomial")
+  summary(test2)$coefficients["test$score", "Pr(>|z|)"] 
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("March/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("March/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))
+
+#wa_pct.
+file = "March/Results/models_copdgene/model_transcript_WallAreaPct_seg_Thirona_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(tpm_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$wa_pct ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$model)
+  summary(test2)[[4]][2,4]   
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("March/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("March/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+
+#f2575ab5
+file = "March/Results/models_copdgene/model_transcript_FEF2575_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(tpm_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$f2575ab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)[[4]][2,4] 
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("March/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("March/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+
+#pefab5
+file = "March/Results/models_copdgene/model_transcript_PEF_post_P2.rds"
+  mod = readRDS(file)
+  test = model_select(mod)
+  test = replicate(tpm_five, mod$modlist[[test[1]]], lambda = test[2]) #
+  test = merge(test, pd, by.x = "row.names", by.y = "sidno")
+  test2 = lm(test$pefab5 ~ test$score + test$age5c + as.factor(test$race1c) + test$gender1 + as.factor(test$cig5c) + test$pkyrs5c + test$htcm5)
+  summary(test2)[[4]][2,4] 
+  test = test %>% dplyr::select(Row.names, score)
+  file = gsub("March/Results/models_copdgene/", "", file)
+  file = gsub(".rds", "", file)
+  names(test)[2] = file
+  saveRDS(test, paste0("March/Results/predictions_mesa/", file, "_prediction_Exam5omics.rds"))  
+
+
+```

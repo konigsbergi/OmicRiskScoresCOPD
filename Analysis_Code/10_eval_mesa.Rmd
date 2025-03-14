@@ -1,0 +1,534 @@
+---
+title: "MESA Evaluation"
+author: "Iain R. Konigsberg"
+output: html_document
+date: '`r Sys.Date()`'
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T)
+knitr::opts_knit$set(root.dir = "C:/Users/konigsbi/Desktop/ors_topmed/March/Results/predictions_mesa/")
+
+```
+
+
+```{r message=F}
+library(dplyr)
+library(ggpubr)
+library(stringr)
+library(tidyr)
+library(sjPlot)
+library(MASS)
+library(rsq)
+library(pROC)
+library(data.table)
+
+theme_set(theme_bw())
+
+start = Sys.time()
+
+set.seed(11)
+
+setwd("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/predictions_mesa/")
+files = dir()
+
+#subset to model files. 
+
+
+```
+
+with mesa, i think it is legitmately easiest to individually model things. i cant automate too heavily. 
+
+
+aggregate results. 
+```{r}
+#set up pd...
+pd = fread("C:/Users/konigsbi/Desktop/ors_topmed/Data/MESA/SHARe Phenotype Datasets/MESAExam1_5/SHARe_Exam1Main.txt") #6431
+pd = as.data.frame(pd) %>% dplyr::select(sidno, age1c, race1c, gender1, site1c, bmi1c, pkyrs1c, cig1c, htcm1)
+pd2 = fread("C:/Users/konigsbi/Desktop/ors_topmed/Data/MESA/SHARe Phenotype Datasets/MESAExam1_5/SHARe_Exam5Main.txt")
+pd2 = as.data.frame(pd2) %>% dplyr::select(sidno, age5c, site5c, bmi5c, pkyrs5c, cig5c, htcm5)
+pd = merge(pd, pd2, by = "sidno", all = T)
+#should take note of exclusions
+spiro = as.data.frame(fread("C:/Users/konigsbi/Desktop/ors_topmed/Data/MESA/SHARe Phenotype Datasets/Lung/SHARe_AncilMesaLungSpirometryExam5.txt")) 
+spiro = spiro %>% dplyr::select(sidno, fev1ab5, fvcab5, fevfvcab5, cpgoldab5, cpstgab5, f2575ab5, pefab5)
+pd = merge(pd, spiro, by = "sidno", all = T)
+ct = as.data.frame(fread("C:/Users/konigsbi/Desktop/ors_topmed/Data/MESA/SHARe Phenotype Datasets/Lung/SHARe_AncilMesaLungExam1CT.txt")) #6425. 3853 w/ exam1 scans.  
+ct = ct %>% dplyr::select(sidno, B_tot_vx, B_be_950, model) 
+ct$pctemph = ct$B_be_950/ct$B_tot_vx #needs to be log transformed for analysis. 
+pd = merge(pd, ct, by = "sidno", all = T)
+airway = as.data.frame(fread("C:/Users/konigsbi/Desktop/ors_topmed/Data/MESA/SHARe Phenotype Datasets/Lung/SHARe_AncilMesaLungAirway.txt"))
+airway = airway %>% dplyr::select(sidno, wall_thickness, wa_pct)
+pd = merge(pd, airway, by = "sidno", all = T)
+
+
+pd$pctemph = log(pd$pctemph)
+
+#
+
+dir = "C:/Users/konigsbi/Desktop/ors_topmed/March/Results/predictions_mesa/"
+files = dir(dir)
+files = paste0(dir, files)
+
+x = files[1]
+comb = data.frame()
+for (x in files){
+  cur = readRDS(x)
+  names(cur) = gsub("model_", "", colnames(cur))
+  cur = cur[!is.na(cur$Row.names), ]
+  rownames(cur) = cur$Row.names
+  comb = merge(comb, cur, by = "row.names", all = T)
+  rownames(comb) = comb$Row.names
+  comb$Row.names = NULL
+}  
+
+comb = comb[, -grep("Row.names", colnames(comb))]
+
+
+for (x in 1:ncol(comb)){
+  comb[,x] = as.numeric(comb[,x])
+}
+
+comb = merge(comb, pd, by.x = "row.names", by.y = "sidno")
+rownames(comb) = comb$Row.names
+#
+```
+
+prot
+```{r}
+df = NULL
+
+#fev1; P2
+mod = lm(fev1ab5 ~ protein_FEV1_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(fev1ab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FEV1", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#fvc; P2
+mod = lm(fvcab5 ~ protein_FVC_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(fvcab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FVC", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#fev1/fvc; P2
+mod = lm(fevfvcab5 ~ protein_FEV1_FVC_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(fevfvcab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FEV1/FVC", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#stage; P2
+mod = lm(cpstgab5 ~ protein_finalGold_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb)
+null = lm(cpstgab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("Severity", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#emphysema
+mod = lm(pctemph ~ protein_pctEmph_Thirona_P2 + gender1 + as.factor(race1c) + age1c + as.factor(cig1c) + pkyrs1c + model, comb)
+null = lm(pctemph ~ gender1 + as.factor(race1c) + age1c + as.factor(cig1c) + pkyrs1c + bmi1c + model, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("Emphysema", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#copd; P2
+mod = glm(cpgoldab5 ~ protein_copd_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb, family = "binomial")
+null = glm(cpgoldab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb, family = "binomial")
+terms = get_model_data(mod, type = "std")
+part = NA
+pred1 = predict(mod, type = "response")
+pheno = comb[rownames(comb) %in% names(pred1), ]$cpgoldab5
+rsq.full = auc(pheno, pred1)[1]
+pred2 = predict(null, type = "response")
+pheno = comb[rownames(comb) %in% names(pred2), ]$cpgoldab5
+rsq.null = auc(pheno, pred2)[1]
+df = rbind(df, c("COPD", summary(mod)$coefficients[2, "Pr(>|z|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#delong test
+roc.test(auc(comb[rownames(comb) %in% names(pred1), ]$cpgoldab5, pred1), auc(comb[rownames(comb) %in% names(pred2), ]$cpgoldab5, pred2))$p.value 
+
+#f2575ab5
+mod = lm(f2575ab5 ~ protein_FEF2575_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(f2575ab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FEF25-75", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+#pefab5
+mod = lm(pefab5 ~ protein_PEF_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(pefab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("PEF", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full))
+
+
+prot_df = as.data.frame(df)
+names(prot_df) = c("pheno", "pval", "beta", "ci.low", "ci.high", "rsq.partial", "rsq.null", "rsq.full")
+for (x in 2:ncol(prot_df)){
+  prot_df[,x] = as.numeric(prot_df[,x])
+}
+
+
+
+```
+
+met
+```{r}
+df = NULL
+
+#fev1; P2
+mod = lm(fev1ab5 ~ metabolite_FEV1_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(fev1ab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FEV1", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#fvc; P2
+mod = lm(fvcab5 ~ metabolite_FVC_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(fvcab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FVC", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#fev1/fvc; P2
+mod = lm(fevfvcab5 ~ metabolite_FEV1_FVC_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(fevfvcab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FEV1/FVC", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#stage; P2
+mod = lm(cpstgab5 ~ metabolite_finalGold_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb)
+null = lm(cpstgab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("Severity", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#emphysema
+mod = lm(pctemph ~ metabolite_pctEmph_Thirona_P2 + gender1 + as.factor(race1c) + age1c + as.factor(cig1c) + pkyrs1c + bmi1c + model, comb)
+null = lm(pctemph ~ gender1 + as.factor(race1c) + age1c + as.factor(cig1c) + pkyrs1c + bmi1c + model, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("Emphysema", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#copd; P2
+#mod = glm(cpgoldab5 ~ metabolite_copd_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb, family = "binomial")
+#null = glm(cpgoldab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb, family = "binomial")
+terms = get_model_data(mod, type = "std")
+part = NA
+pred1 = predict(mod, type = "response")
+pheno = comb[rownames(comb) %in% names(pred1), ]$cpgoldab5
+rsq.full = auc(pheno, pred1)[1]
+pred2 = predict(null, type = "response")
+pheno = comb[rownames(comb) %in% names(pred2), ]$cpgoldab5
+rsq.null = auc(pheno, pred2)[1]
+#df = rbind(df, c("COPD", summary(mod)$coefficients[2, "Pr(>|z|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+df = rbind(df, c("COPD", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#delong test
+roc.test(auc(comb[rownames(comb) %in% names(pred1), ]$cpgoldab5, pred1), auc(comb[rownames(comb) %in% names(pred2), ]$cpgoldab5, pred2))$p.value 
+
+
+#f2575ab5
+mod = lm(f2575ab5 ~ metabolite_FEF2575_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(f2575ab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FEF25-75", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+#pefab5
+mod = lm(pefab5 ~ metabolite_PEF_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(pefab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("PEF", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full))
+
+
+met_df = as.data.frame(df)
+names(met_df) = c("pheno", "pval", "beta", "ci.low", "ci.high", "rsq.partial", "rsq.null", "rsq.full")
+for (x in 2:ncol(met_df)){
+  met_df[,x] = as.numeric(met_df[,x])
+}
+
+met_df[met_df$pheno == "COPD", 3:ncol(met_df)] = NA
+```
+
+trans
+```{r}
+df = NULL
+
+#fev1; P2
+mod = lm(fev1ab5 ~ transcript_FEV1_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(fev1ab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FEV1", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#fvc; P2
+mod = lm(fvcab5 ~ transcript_FVC_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(fvcab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FVC", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#fev1/fvc; P2
+mod = lm(fevfvcab5 ~ transcript_FEV1_FVC_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(fevfvcab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FEV1/FVC", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#stage; P2
+mod = lm(cpstgab5 ~ transcript_finalGold_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb)
+null = lm(cpstgab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("Severity", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#emphysema
+mod = lm(pctemph ~ transcript_pctEmph_Thirona_P2 + gender1 + as.factor(race1c) + age1c + as.factor(cig1c) + pkyrs1c + bmi1c + model, comb)
+null = lm(pctemph ~ gender1 + as.factor(race1c) + age1c + as.factor(cig1c) + pkyrs1c + bmi1c + model, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("Emphysema", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#copd; P2
+mod = glm(cpgoldab5 ~ transcript_copd_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb, family = "binomial")
+null = glm(cpgoldab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c, comb, family = "binomial")
+terms = get_model_data(mod, type = "std")
+part = NA
+pred1 = predict(mod, type = "response")
+pheno = comb[rownames(comb) %in% names(pred1), ]$cpgoldab5
+rsq.full = auc(pheno, pred1)[1]
+pred2 = predict(null, type = "response")
+pheno = comb[rownames(comb) %in% names(pred2), ]$cpgoldab5
+rsq.null = auc(pheno, pred2)[1]
+df = rbind(df, c("COPD", summary(mod)$coefficients[2, "Pr(>|z|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#f2575ab5
+mod = lm(f2575ab5 ~ transcript_FEF2575_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(f2575ab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("FEF25-75", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full)) 
+
+#pefab5
+mod = lm(pefab5 ~ transcript_PEF_post_P2 + gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+null = lm(pefab5 ~ gender1 + as.factor(race1c) + age5c + as.factor(cig5c) + pkyrs5c + htcm5, comb)
+terms = get_model_data(mod, type = "std")
+part = rsq.partial(mod, null, adj = T)$partial.rsq
+rsq.full = summary(mod)$adj.r.squared
+rsq.null = summary(null)$adj.r.squared
+df = rbind(df, c("PEF", summary(mod)$coefficients[2, "Pr(>|t|)"], terms$estimate[1], terms$conf.low[1], terms$conf.high[1], part, rsq.null, rsq.full))
+
+
+trans_df = as.data.frame(df)
+names(trans_df) = c("pheno", "pval", "beta", "ci.low", "ci.high", "rsq.partial", "rsq.null", "rsq.full")
+for (x in 2:ncol(trans_df)){
+  trans_df[,x] = as.numeric(trans_df[,x])
+}
+
+
+
+```
+
+combine
+```{r}
+prot_df$type = "Protein"
+met_df$type = "Metabolite"
+trans_df$type = "Transcript"
+df = as.data.frame(rbind(prot_df, met_df, trans_df))
+
+df$bh = p.adjust(df$pval, method = "BH")
+df$sig = F
+df[df$bh <= .05, ]$sig = T
+
+df$class = "Gaussian"
+df[df$pheno == "COPD", ]$class = "Binomial"
+
+df$class = factor(df$class, levels = c("Gaussian", "Binomial"))
+
+write.csv(df, "C:/Users/konigsbi/Desktop/ors_topmed/March/Full_MESA_forSupp.csv")
+
+
+#volc
+a_one = ggplot(df, aes(beta, -log10(bh), color = type)) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.4) +
+  geom_point() +
+  ggrepel::geom_label_repel(aes(label = pheno, fill = type), alpha = 0.7, size = 3, box.padding = 0.1, seed = 11, color = "black") +
+  facet_wrap(~class, scales = "free") +
+  labs(x = "Effect Size", y = "-log10(adjusted p-value)", title = "MESA Replication", color = "") + 
+  theme(strip.background = element_blank(), strip.text.x = element_text(size = 10)) +
+  guides(fill = "none")
+#a_one
+#ggsave("C:/Users/konigsbi/Desktop/ors_topmed/March/Figures/mesa_scorevolcs_multi.png", units = "in", height = 6, width = 12)
+
+#ggplot(df, aes(beta, -log10(bh), color = type, shape = class)) + 
+#  geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.4) +
+#  geom_point() +
+#  ggrepel::geom_label_repel(aes(label = pheno), alpha = 0.7, size = 3, box.padding = 0.1) +
+#  labs(x = "Effect Size", y = "-log10(adjusted P-Value)") +
+#  scale_shape_manual(values = c(17, 16 , 15, 18))
+#ggsave("C:/Users/konigsbi/Desktop/ors_topmed/March/Figures/mesa_scorevolcs_single.png", units = "in", height = 6, width = 8)
+
+#quant r2. 
+
+#plot betas
+#ggplot(df[df$class == "Gaussian", ], aes(beta, factor(pheno, levels = rev(levels(factor(pheno)))), alpha = sig, group = type, color = type)) + 
+#  geom_point(position = position_dodge(width = .5)) + 
+#  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") + 
+#  geom_errorbar(aes(xmin = ci.low, xmax = ci.high), width = 0, position = position_dodge(width = .5)) + 
+#  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+#  labs(x = "\u03b2 Coefficient", y = "") + 
+#  scale_alpha_manual(values = c(.3, 1)) +
+#  guides(alpha = "none")
+
+#ggsave("C:/Users/konigsbi/Desktop/ors_topmed/March/Figures/MESA_betas.png", units = "in", height = 6, width = 6)
+
+#OR
+#ggplot(df[df$class == "Binomial", ], aes(beta, factor(pheno, levels = rev(levels(factor(pheno)))), alpha = sig, group = type, color = type)) + 
+#  geom_point(position = position_dodge(width = .5)) + 
+#  geom_vline(xintercept = 1, linetype = "dashed", color = "grey30") + 
+#  geom_errorbar(aes(xmin = ci.low, xmax = ci.high), width = 0, position = position_dodge(width = .5)) + 
+#  theme(plot.title = element_text(hjust = 0.5)) + 
+#  labs(x = "Odds Ratio", y = "") + 
+#  scale_alpha_manual(values = c(.3, 1)) +
+#  guides(alpha = "none") +
+#  xlim(0, 4)
+
+#ggsave("C:/Users/konigsbi/Desktop/ors_topmed/March/Figures/MESA_oddsratios.png", units = "in", height = 2, width = 7)
+#2 are supposed to be sig, however, "betas" are at like 0... oh, its the fucked metabolite estimate..... i imposed an xlim
+
+#plot rsqs
+#ggplot(df[df$class == "Gaussian", ]) + 
+#  geom_bar(aes(rsq.full, pheno, fill = type, alpha = sig), stat = "identity", position = "dodge") + 
+#  geom_bar(aes(rsq.null, pheno), stat = "identity", position = "dodge") + 
+#  theme(plot.title = element_text(hjust = 0.5)) + 
+#  labs(x = bquote("Adjusted R"^2), y = "", fill = "") +
+#  scale_y_discrete(limits = rev(levels(factor(df[df$class == "quant", ]$pheno)))) + 
+#  scale_alpha_manual(values = c(0, 1)) +
+#  guides(alpha = "none") +
+#  xlim(0, 1)
+#ggsave("C:/Users/konigsbi/Desktop/ors_topmed/March/Figures/MESA_rsqs.png", units = "in", height = 6, width = 7)
+
+#AUC
+#ggplot(df[df$class == "Binomial", ]) + 
+#  geom_bar(aes(rsq.full, pheno, fill = type, alpha = sig), stat = "identity", position = "dodge") + 
+#  geom_bar(aes(rsq.null, pheno), stat = "identity", position = "dodge") + 
+#  theme(plot.title = element_text(hjust = 0.5)) + 
+#  labs(x = bquote("AUROC"), y = "Trait", fill = "") +
+  #scale_y_discrete(limits = rev(levels(factor(df[df$class == "quant", ]$pheno)))) + 
+#  scale_alpha_manual(values = c(0, 1)) +
+#  guides(alpha = "none") +
+#  coord_cartesian(xlim=c(0.5, 1))
+#ggsave("C:/Users/konigsbi/Desktop/ors_topmed/March/Figures/MESA_aucs.png", units = "in", height = 6, width = 7)
+
+
+
+
+```
+
+save something for combined rep fig. 
+a. volcano. save individual ggplots as objects. save as .Rdata. 
+```{r}
+df$class = as.character(df$class)
+
+a = ggplot(df[df$class == "Gaussian", ], aes(beta, factor(pheno, levels = rev(levels(factor(pheno)))), alpha = sig, group = type, color = type)) + 
+  geom_point(position = position_dodge(width = .5)) + 
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") + 
+  geom_errorbar(aes(xmin = ci.low, xmax = ci.high), width = 0, position = position_dodge(width = .5)) + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+  labs(x = "\u03b2 Coefficient", y = "") + 
+  scale_alpha_manual(values = c(.3, 1)) +
+  guides(alpha = "none")
+
+#OR
+b = ggplot(df[df$class == "Binomial", ], aes(beta, factor(pheno, levels = rev(levels(factor(pheno)))), alpha = sig, group = type, color = type)) + 
+  geom_point(position = position_dodge(width = .5)) + 
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey30") + 
+  geom_errorbar(aes(xmin = ci.low, xmax = ci.high), width = 0, position = position_dodge(width = .5)) + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+  labs(x = "Odds Ratio", y = "") + 
+  scale_alpha_manual(values = c(1)) +
+  guides(alpha = "none")
+
+#plot rsqs
+c = ggplot(df[df$class == "Gaussian", ]) + 
+  geom_bar(aes(rsq.full, factor(pheno, levels = rev(levels(factor(pheno)))), fill = type, alpha = sig), stat = "identity", position = "dodge") + 
+  geom_bar(aes(rsq.null, factor(pheno, levels = rev(levels(factor(pheno))))), stat = "identity", position = "dodge") + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+  labs(x = bquote("Adjusted R"^2), y = "", fill = "") +
+  #scale_y_discrete(limits = rev(levels(factor(df[df$class == "Gaussian", ]$pheno)))) + 
+  scale_alpha_manual(values = c(0.3, 1)) +
+  guides(alpha = "none") +
+  xlim(0, 1)
+
+
+#AUC
+d = ggplot(df[df$class == "Binomial", ]) + 
+  geom_bar(aes(rsq.full, factor(pheno, levels = rev(levels(factor(pheno)))), fill = type, alpha = sig), stat = "identity", position = "dodge") + 
+  geom_bar(aes(rsq.null, factor(pheno, levels = rev(levels(factor(pheno))))), stat = "identity", position = "dodge") + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") + 
+  labs(x = bquote("AUROC"), y = "", fill = "") +
+  #scale_y_discrete(limits = rev(levels(factor(df[df$class == "quant", ]$pheno)))) + 
+  scale_alpha_manual(values = c(1)) +
+  guides(alpha = "none") +
+  coord_cartesian(xlim = c(0.5, 1))
+
+
+png("C:/Users/konigsbi/Desktop/ors_topmed/March/Figures/mesa_replication_draft.png", units = "in", res = 500, height = 9, width = 12)
+one = cowplot::plot_grid(a_one, labels = c("a. "))
+two = cowplot::plot_grid(a, b, c, d, nrow = 1, labels = c("b. ", "c. ", "d. ", "e. "))
+cowplot::plot_grid(one, two, nrow = 2, rel_heights = c(1, .8))
+dev.off()
+
+save(a_one, a, b, c, d, file = "C:/Users/konigsbi/Desktop/ors_topmed/March/Figures/mesa_rep.Rdata")
+
+
+```
+
+```{r}
+Sys.time() - start
+
+sessionInfo()
+```

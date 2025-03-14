@@ -1,0 +1,380 @@
+---
+title: "Aggregating Weights"
+author: "Iain R. Konigsberg"
+date: '`r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: true
+---
+
+# Background
+
+
+***
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = F)
+
+```
+
+```{r message=F}
+library(tableone)
+library(readxl)
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(glmnetUtils)
+
+
+start = Sys.time()
+```
+
+***
+
+# Prepare Data
+
+## Metabolomic Models
+
+```{r}
+
+met_models = dir("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/")
+met_models = met_models[grep("metabolite", met_models)]
+met_models = met_models[-grep("DLCO_GLI", met_models)]
+met_models = met_models[-grep("smok", met_models)]
+met_models = met_models[-grep("PackYears", met_models)]
+met_models = met_models[-grep("Age", met_models)]
+met_models = met_models[-grep("BMI", met_models)]
+met_models = met_models[-grep("P3_AWT", met_models)]
+met_models = met_models[-grep("P3_FRC", met_models)]
+met_models = met_models[-grep("P3_Pi10", met_models)]
+met_models = met_models[-grep("P3_pct", met_models)]
+met_models = met_models[-grep("P3_Wall", met_models)]
+met_models = met_models[-grep("FEV1pp_post_P2", met_models)]
+met_models = met_models[-grep("FVCpp_post_P2", met_models)]
+met_models = met_models[-grep("FEV6", met_models)]
+
+met_models = paste0("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/", met_models)
+
+replicate = function(omics, model, lambda = "lambda.min"){
+  weights = as.data.frame(as.matrix(coef(model, s = lambda)))
+  weights$dummy = NA
+  weights = weights[weights$s1 != 0, ]
+  rownames(weights) = str_split(rownames(weights), "\\.", simplify = T)[,1] #specific to transcriptomics
+  print(paste0("Number of Non-Zero model weights: ", nrow(weights) - 1))
+  print(paste0("Number of Non-Zero model weights in replication sample: ", nrow(weights[rownames(weights) %in% colnames(omics), ])))
+  
+  inty = weights$s1[1]
+  weights = weights[2:nrow(weights), ]
+  
+  weights = weights[rownames(weights) %in% colnames(omics), ]
+  omics_sub = omics[, colnames(omics) %in% rownames(weights)]
+  
+  weights = weights[order(rownames(weights)), ]
+  omics_sub = omics_sub[, order(colnames(omics_sub))]
+  
+  print(paste0("Model Weights & Omics Line Up: ", all(rownames(weights) == colnames(omics_sub))))
+  omics_sub = t(omics_sub)
+  
+  scores = as.data.frame(t(weights$s1 %*% as.matrix(omics_sub) + inty)) 
+  names(scores) = "score"
+  return(scores)
+}
+
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic))
+}
+
+
+mod = readRDS(met_models[1])
+test = model_select(mod)
+df = as.data.frame(as.matrix(coef(mod, alpha = test[3], lambda = test[2])))
+  
+
+for (x in c(2:length(met_models))){
+  print(met_models[x])
+  mod = readRDS(met_models[x])
+  test = model_select(mod)
+  new = as.data.frame(as.matrix(coef(mod, alpha = test[3], lambda = test[2])))
+  df = merge(df, new, by = "row.names")
+  rownames(df) = df$Row.names
+  df$Row.names = NULL
+}
+
+colnames(df) = met_models
+colnames(df) = gsub("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/", "", colnames(df))
+colnames(df) = gsub(".rds", "", colnames(df))
+colnames(df) = gsub("model_metabolite_", "", colnames(df))
+
+head(df)
+
+#remove some additional variables. figure out what is included in final results. 
+
+write.csv(df, "C:/Users/konigsbi/Desktop/ors_topmed/March/Results/MetaboliteModelWeights.csv")
+
+
+
+```
+
+## Proteomic Models
+
+```{r}
+
+met_models = dir("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/")
+met_models = met_models[grep("protein", met_models)]
+met_models = met_models[-grep("DLCO_GLI", met_models)]
+met_models = met_models[-grep("smok", met_models)]
+met_models = met_models[-grep("PackYears", met_models)]
+met_models = met_models[-grep("Age", met_models)]
+met_models = met_models[-grep("BMI", met_models)]
+met_models = met_models[-grep("P3_AWT", met_models)]
+met_models = met_models[-grep("P3_FRC", met_models)]
+met_models = met_models[-grep("P3_Pi10", met_models)]
+met_models = met_models[-grep("P3_pct", met_models)]
+met_models = met_models[-grep("P3_Wall", met_models)]
+met_models = met_models[-grep("FEV1pp_post_P2", met_models)]
+met_models = met_models[-grep("FVCpp_post_P2", met_models)]
+met_models = met_models[-grep("FEV6", met_models)]
+
+met_models = paste0("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/", met_models)
+
+
+#merge everything together. give better feature names. 
+
+replicate = function(omics, model, lambda = "lambda.min"){
+  weights = as.data.frame(as.matrix(coef(model, s = lambda)))
+  weights$dummy = NA
+  weights = weights[weights$s1 != 0, ]
+  rownames(weights) = str_split(rownames(weights), "\\.", simplify = T)[,1] #specific to transcriptomics
+  print(paste0("Number of Non-Zero model weights: ", nrow(weights) - 1))
+  print(paste0("Number of Non-Zero model weights in replication sample: ", nrow(weights[rownames(weights) %in% colnames(omics), ])))
+  
+  inty = weights$s1[1]
+  weights = weights[2:nrow(weights), ]
+  
+  weights = weights[rownames(weights) %in% colnames(omics), ]
+  omics_sub = omics[, colnames(omics) %in% rownames(weights)]
+  
+  weights = weights[order(rownames(weights)), ]
+  omics_sub = omics_sub[, order(colnames(omics_sub))]
+  
+  print(paste0("Model Weights & Omics Line Up: ", all(rownames(weights) == colnames(omics_sub))))
+  omics_sub = t(omics_sub)
+  
+  scores = as.data.frame(t(weights$s1 %*% as.matrix(omics_sub) + inty)) 
+  names(scores) = "score"
+  return(scores)
+}
+
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic))
+}
+
+
+mod = readRDS(met_models[1])
+test = model_select(mod)
+df = as.data.frame(as.matrix(coef(mod, alpha = test[3], lambda = test[2])))
+  
+
+for (x in c(2:length(met_models))){
+  print(met_models[x])
+  mod = readRDS(met_models[x])
+  test = model_select(mod)
+  new = as.data.frame(as.matrix(coef(mod, alpha = test[3], lambda = test[2])))
+  df = merge(df, new, by = "row.names")
+  rownames(df) = df$Row.names
+  df$Row.names = NULL
+}
+
+colnames(df) = met_models
+colnames(df) = gsub("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/", "", colnames(df))
+colnames(df) = gsub(".rds", "", colnames(df))
+colnames(df) = gsub("model_protein_", "", colnames(df))
+
+head(df)
+
+write.csv(df, "C:/Users/konigsbi/Desktop/ors_topmed/March/Results/ProteinModelWeights.csv")
+
+
+
+```
+
+## Transcriptomic Models
+
+```{r}
+
+met_models = dir("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/")
+met_models = met_models[grep("transcript", met_models)]
+met_models = met_models[-grep("DLCO_GLI", met_models)]
+met_models = met_models[-grep("smok", met_models)]
+met_models = met_models[-grep("PackYears", met_models)]
+met_models = met_models[-grep("Age", met_models)]
+met_models = met_models[-grep("BMI", met_models)]
+met_models = met_models[-grep("P3_AWT", met_models)]
+met_models = met_models[-grep("P3_FRC", met_models)]
+met_models = met_models[-grep("P3_Pi10", met_models)]
+met_models = met_models[-grep("P3_pct", met_models)]
+met_models = met_models[-grep("P3_Wall", met_models)]
+met_models = met_models[-grep("FEV1pp_post_P2", met_models)]
+met_models = met_models[-grep("FVCpp_post_P2", met_models)]
+met_models = met_models[-grep("FEV6", met_models)]
+
+met_models = paste0("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/", met_models)
+
+replicate = function(omics, model, lambda = "lambda.min"){
+  weights = as.data.frame(as.matrix(coef(model, s = lambda)))
+  weights$dummy = NA
+  weights = weights[weights$s1 != 0, ]
+  rownames(weights) = str_split(rownames(weights), "\\.", simplify = T)[,1] #specific to transcriptomics
+  print(paste0("Number of Non-Zero model weights: ", nrow(weights) - 1))
+  print(paste0("Number of Non-Zero model weights in replication sample: ", nrow(weights[rownames(weights) %in% colnames(omics), ])))
+  
+  inty = weights$s1[1]
+  weights = weights[2:nrow(weights), ]
+  
+  weights = weights[rownames(weights) %in% colnames(omics), ]
+  omics_sub = omics[, colnames(omics) %in% rownames(weights)]
+  
+  weights = weights[order(rownames(weights)), ]
+  omics_sub = omics_sub[, order(colnames(omics_sub))]
+  
+  print(paste0("Model Weights & Omics Line Up: ", all(rownames(weights) == colnames(omics_sub))))
+  omics_sub = t(omics_sub)
+  
+  scores = as.data.frame(t(weights$s1 %*% as.matrix(omics_sub) + inty)) 
+  names(scores) = "score"
+  return(scores)
+}
+
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic))
+}
+
+
+mod = readRDS(met_models[1])
+test = model_select(mod)
+df = as.data.frame(as.matrix(coef(mod, alpha = test[3], lambda = test[2])))
+  
+
+for (x in c(2:length(met_models))){
+  print(met_models[x])
+  mod = readRDS(met_models[x])
+  test = model_select(mod)
+  new = as.data.frame(as.matrix(coef(mod, alpha = test[3], lambda = test[2])))
+  df = merge(df, new, by = "row.names")
+  rownames(df) = df$Row.names
+  df$Row.names = NULL
+}
+
+colnames(df) = met_models
+colnames(df) = gsub("C:/Users/konigsbi/Desktop/ors_topmed/March/Results/models_copdgene/", "", colnames(df))
+colnames(df) = gsub(".rds", "", colnames(df))
+colnames(df) = gsub("model_transcript_", "", colnames(df))
+
+head(df)
+
+write.csv(df, "C:/Users/konigsbi/Desktop/ors_topmed/March/Results/TranscriptModelWeights.csv")
+
+
+
+```
+
+***
+
+# Wrap-Up
+
+```{r}
+Sys.time() - start
+
+sessionInfo()
+```
+
+

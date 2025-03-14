@@ -1,0 +1,326 @@
+---
+title: "Transcriptomic Risk Score Replication in SPIROMICS"
+author: "Iain R. Konigsberg"
+date: '`r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: true
+---
+
+# Background
+
+This Rmd contains code to apply transcriptomic risk score models to SPIROMICS participants. 
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/konigsbi/Desktop/ors_topmed/")
+```
+
+
+```{r message=F}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(glmnetUtils)
+library(readxl)
+library(stringr)
+library(sjPlot)
+library(ggpubr)
+library(MASS)
+
+setwd("C:/Users/konigsbi/Desktop/ors_topmed/")
+
+start = Sys.time()
+
+theme_set(theme_bw())
+set.seed(11)
+
+replicate = function(omics, model, lambda = "lambda.min"){
+  weights = as.data.frame(as.matrix(coef(model, s = lambda)))
+  weights$dummy = NA
+  weights = weights[weights$s1 != 0, ]
+  rownames(weights) = str_split(rownames(weights), "\\.", simplify = T)[,1] #specific to transcriptomics
+  print(paste0("Number of Non-Zero model weights: ", nrow(weights) - 1))
+  print(paste0("Number of Non-Zero model weights in replication sample: ", nrow(weights[rownames(weights) %in% colnames(omics), ])))
+  
+  inty = weights$s1[1]
+  weights = weights[2:nrow(weights), ]
+  
+  weights = weights[rownames(weights) %in% colnames(omics), ]
+  omics_sub = omics[, colnames(omics) %in% rownames(weights)]
+  
+  weights = weights[order(rownames(weights)), ]
+  omics_sub = omics_sub[, order(colnames(omics_sub))]
+  
+  print(paste0("Model Weights & Omics Line Up: ", all(rownames(weights) == colnames(omics_sub))))
+  omics_sub = t(omics_sub)
+  
+  scores = as.data.frame(t(weights$s1 %*% as.matrix(omics_sub) + inty)) 
+  names(scores) = "score"
+  return(scores)
+}
+
+model_select = function(mod){
+  index = 1
+  df = NULL
+  for (x in 1:11){
+    alpha = mod$alpha[x]
+    moddy = mod$modlist[[x]]
+    for (y in 1:length(moddy$lambda)){
+      lambda = moddy$lambda[y]
+      nonzero = moddy$nzero[y]
+      measure = moddy$cvm[y]
+      se = moddy$cvsd[y]
+      df = rbind(df, c(alpha, index, lambda, nonzero, measure, se))
+    }
+    index = index + 1
+  }
+  df = as.data.frame(df)
+  names(df) = c("alpha", "index", "lambda", "nonzero", "measure", "se")
+  
+  df = df[df$nonzero != 0, ]
+  
+  min_measure = df[df$measure == min(df$measure), ]$measure
+  se_measure = df[df$measure == min(df$measure), ]$se
+  sub_df = df[df$measure <= min_measure + se_measure, , drop = F]
+  sub_df = sub_df[sub_df$alpha == max(sub_df$alpha), , drop = F]
+  alpha_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$alpha
+  lambda_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$lambda
+  nonzero_elastic = sub_df[sub_df$lambda == max(sub_df$lambda), ]$nonzero
+  alpha_index = sub_df[sub_df$lambda == max(sub_df$lambda), ]$index
+  return(c(alpha_index, lambda_elastic, alpha_elastic))
+}
+
+```
+
+# Prepare Transcripts
+
+```{r}
+rna = as.data.frame(fread("Data/SPIROMICS/Transcriptome/meyers_topmed_to3_rnaseq_1.rsem_genes_tpm.txt", header = T)) 
+dim(rna) 
+#genes in rows. samps in cols. 
+
+pd_rna = as.data.frame(fread("Data/SPIROMICS/Transcriptome/SPIROMICS_phs001927_RNA-seq_SampleAttributesDS_20220122.txt")) 
+pd_rna = pd_rna %>% dplyr::select(SAMPLE_ID, NWGC_ID, Collection_visit, Age_at_collection, Investigator_ID)
+pd_rna = pd_rna[pd_rna$Collection_visit == "BASELINE", ]
+att = as.data.frame(fread("Data/SPIROMICS/Transcriptome/SPIROMICS_phs001927_RNA-seq_SampleMappingDS_20220122.txt"))
+pd_rna = merge(pd_rna, att, by = "SAMPLE_ID") 
+
+#merge in pheno info. 
+pd = as.data.frame(fread("Data/SPIROMICS/90987/dbgap_submission/UnprocessedPheno20230210/SPIROMICS_I_TOPMed_CORE6_3_LONGITUDINAL_20230209.txt"))
+pd = pd[pd$VISIT == "VISIT_1", ]
+pd_rna = merge(pd_rna, pd, by.x = "SUBJECT_ID", by.y = "DBGAPID", all.x = T) 
+
+#subset rna
+rownames(rna) = rna$gene_id
+rna = rna[,3:ncol(rna)]
+rna = rna[, colnames(rna) %in% pd_rna$NWGC_ID, ]
+dim(rna) #1840
+
+
+rownames(rna) = make.unique(stringr::str_split(rownames(rna), "\\.", simplify = T)[,1])
+
+rna = t(rna)
+
+rna = log(rna + 1)
+pd = pd_rna
+
+```
+
+# Calculate TransRS
+
+```{r}
+#FEV1_P2 --> OBS_FEV1
+file = "March/Results/models_copdgene/model_transcript_FEV1_post_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test2 = lm(test$OBS_FEV1 ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS + test$HT_CM)
+summary(test2)$coefficients["test$score", "Pr(>|t|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+  
+    
+#FVC_P2 --> POST_FVC_DERV
+file = "March/Results/models_copdgene/model_transcript_FVC_post_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test2 = lm(test$POST_FVC_DERV ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS + test$HT_CM)
+summary(test2)$coefficients["test$score", "Pr(>|t|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+  
+
+#fev1/fvc POST_FEV1FVC_DERV
+file = "March/Results/models_copdgene/model_transcript_FEV1_FVC_post_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test2 = lm(test$POST_FEV1FVC_DERV ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS + test$HT_CM)
+summary(test2)$coefficients["test$score", "Pr(>|t|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+#finalGold_P2 --> GOLD_STAGE_COPD_SEVERITY
+file = "March/Results/models_copdgene/model_transcript_finalGold_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test = test[test$GOLD_STAGE_COPD_SEVERITY != "N", ]
+test2 = lm(as.numeric(test$GOLD_STAGE_COPD_SEVERITY) ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS + test$HT_CM) #update covars. 
+summary(test2)$coefficients["test$score", "Pr(>|t|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+
+#chronic brochnits 
+file = "March/Results/models_copdgene/model_transcript_Chronic_Bronchitis_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test2 = glm(test$CHRONIC_BRONCHITIS ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS, family = "binomial")
+summary(test2)$coefficients["test$score", "Pr(>|z|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+#copd
+file = "March/Results/models_copdgene/model_transcript_copd_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test$copd = 0
+test[!is.na(test$GOLD_STAGE_COPD_SEVERITY) & test$GOLD_STAGE_COPD_SEVERITY != "0" & test$GOLD_STAGE_COPD_SEVERITY != "N", ]$copd = 1
+test2 = glm(test$copd ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS, family = "binomial")
+summary(test2)$coefficients["test$score", "Pr(>|z|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+#POST_FEF2575_DERV
+file = "March/Results/models_copdgene/model_transcript_FEF2575_post_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test2 = lm(test$POST_FEF2575_DERV ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS + test$HT_CM)
+summary(test2)$coefficients["test$score", "Pr(>|t|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+#PEF -> POST_PEFR_DERV
+file = "March/Results/models_copdgene/model_transcript_PEF_post_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test2 = lm(test$POST_PEFR_DERV ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS + test$HT_CM)
+summary(test2)$coefficients["test$score", "Pr(>|t|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+#6mw -> SMWD_PRED_V1. 
+file = "March/Results/models_copdgene/model_transcript_distwalked_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test2 = lm(test$SIX_MINUTE_WALK_DISTANCE ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS)
+summary(test2)$coefficients["test$score", "Pr(>|t|)"] 
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+#NEGBINOM traits
+#BODE
+file = "March/Results/models_copdgene/model_transcript_BODE_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test2 = glm.nb(test$BODE_INDEX ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS)
+summary(test2)$coefficients["test$score", "Pr(>|z|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+#SGRQ
+file = "March/Results/models_copdgene/model_transcript_SGRQ_scoreTotal_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+test2 = glm.nb(round(test$SGR_TOTALSCORE) ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS)
+summary(test2)$coefficients["test$score", "Pr(>|z|)"]  
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+#chronbronch
+file = "March/Results/models_copdgene/model_transcript_Chronic_Bronchitis_P2.rds"
+mod = readRDS(file)
+test = model_select(mod)
+test = replicate(rna, mod$modlist[[test[1]]], lambda = test[2]) #
+test = merge(test, pd, by.x = "row.names", by.y = "NWGC_ID")
+#test$WHOLE_TREE_ALL = log(test$WHOLE_TREE_ALL)
+test2 = glm(test$CHRONIC_BRONCHITIS_SGR ~ test$score + test$AGE_DERV + as.factor(test$RACE) + test$GENDER + test$CURRENT_SMOKER + test$SMOKING_PACK_YEARS, family = binomial)
+summary(test2)$coefficients["test$score", "Pr(>|z|)"]  #
+test = test %>% dplyr::select(Row.names, score)
+file = gsub("March/Results/models_copdgene/model_", "", file)
+file = gsub(".rds", "", file)
+names(test)[2] = file
+saveRDS(test, paste0("March/Results/predictions_spiromics/", file, "_predictions.rds"))  
+
+
+```
+
+# Wrap-Up
+
+```{r}
+Sys.time() - start
+
+sessionInfo()
+```
+
